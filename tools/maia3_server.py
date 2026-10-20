@@ -48,6 +48,9 @@ class Uci:
             if line.startswith(prefix):
                 return line.strip()
 
+    def option(self, name, value):
+        self.send(f"setoption name {name} value {value}")
+
     def best(self, fen):
         self.send("position fen " + fen)
         self.send("go nodes 1")  # maia3 answers with one forward pass
@@ -86,6 +89,13 @@ class Pool:
                     self.engine.close()
                 print(f"starting engine: model {model}, rating {elo} (the first start loads the model, be patient)")
                 self.engine = Uci(self.command(model, elo))
+                # maia3 normally picks a human-like move at random (a human blunders now and then).
+                # temperature 0 makes it always play its most likely move, which is far stronger
+                self.engine.option("Temperature", self.args.temperature)
+                self.engine.option("SelfElo", elo)
+                self.engine.option("OppoElo", self.args.oppo_elo or elo)
+                self.engine.send("isready")
+                self.engine.wait("readyok")
                 self.key = key
             try:
                 return self.engine.best(fen)
@@ -144,6 +154,8 @@ def main():
     ap.add_argument("--model", default="23m", help="5m, 23m or 79m")
     ap.add_argument("--elo", type=int, default=1500)
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--temperature", default="0", help="0 = always the most likely move (strongest). 1 = human-like randomness")
+    ap.add_argument("--oppo-elo", type=int, default=0, help="rating of the opponent bot you play, 0 = same as your maia rating")
     ap.add_argument("--cmd", default=None, help="advanced: run another uci engine instead, {model} and {elo} get filled in")
     args = ap.parse_args()
     pool = Pool(args)
