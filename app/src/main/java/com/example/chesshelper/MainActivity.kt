@@ -137,9 +137,18 @@ class MainActivity : Activity() {
         // ---- side bar
         card = newCard("side bar")
         card.addView(chip("show the side handle while playing", c.sidebar) { on -> save { it.putBoolean("sidebar", on) } })
-        label(card, "touch the screen edge to see it, slide it inward to open the quick menu, drag it up or down to move it")
-        label(card, "handle side")
-        card.addView(seg(listOf("left" to "left", "right" to "right"), if (c.handleRight) "right" else "left") { v -> save { it.putString("handle_side", v) } })
+        label(card, "edge bar: touch the screen edge, then tap it or slide it inward to open the quick menu. drag it up or down to move it. circle: a round button you can drag anywhere, tap it to open the menu")
+        card.addView(seg(listOf("bar" to "edge bar", "circle" to "circle"), c.handleMode) { v ->
+            storeText()
+            save { it.putString("handle_mode", v) }
+            root.post { rebuild() }
+        })
+        if (c.handleMode != "circle") {
+            label(card, "edge")
+            card.addView(seg(listOf("left" to "left", "right" to "right"), if (c.handleRight) "right" else "left") { v -> save { it.putString("handle_side", v) } })
+        }
+        card.addView(slider(70, 180, 10, (c.handleSize * 100).toInt(), { "handle size: $it%" }) { v -> save { it.putInt("handle_size", v) } })
+        card.addView(slider(0, 100, 5, (c.handleIdle * 100).toInt(), { "visible when not touched: $it%" }) { v -> save { it.putInt("handle_idle", v) } })
         label(card, "max power saves per game")
         card.addView(seg(listOf("1" to "1", "3" to "3", "5" to "5", "-1" to "∞"), c.savesPerGame.toString()) { v -> save { it.putInt("saves", v.toInt()) } })
 

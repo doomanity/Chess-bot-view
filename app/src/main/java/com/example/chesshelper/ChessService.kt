@@ -170,7 +170,8 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
         if (key != null && key in Cfg.LOOK_KEYS) {
             overlay?.setLook(lookOf(c))
             shownModel?.let { if (overlayShown) overlay?.setModel(it) }
-            if (key == "sidebar" || key == "theme" || key == "handle_side") {
+            if (key == "sidebar" || key == "theme" || key == "handle_side" || key == "handle_mode" ||
+                key == "handle_size" || key == "handle_idle") {
                 val sb = sideBar
                 if (c.sidebar && sb == null) {
                     sideBar = SideBar(this, wm, this).also { it.show() }
@@ -205,6 +206,8 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
     override fun status(): String = "$engineName · ${lastSaid.ifEmpty { "starting" }}"
 
     override fun savesLeft(): Int = savesLeft
+
+    override fun boardRect(): RectF? = geom?.let { RectF(it.left.toFloat(), it.top.toFloat(), (it.left + it.size).toFloat(), (it.top + it.size).toFloat()) }
 
     /** applies changed settings on the worker thread */
     private fun applyEngineSettings() {

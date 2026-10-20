@@ -34,6 +34,11 @@ class Cfg(p: SharedPreferences) {
     val handleRight = p.getString("handle_side", "right") != "left"
     val handleY = p.getFloat("handle_y", 0.42f)
     val savesPerGame = p.getInt("saves", 3)                     // -1 = unlimited
+    val handleMode = p.getString("handle_mode", "bar") ?: "bar"   // bar (screen edge) or circle (drag anywhere)
+    val handleSize = p.getInt("handle_size", 100) / 100f          // 0.7 .. 1.8
+    val handleIdle = p.getInt("handle_idle", 15) / 100f           // how visible it is when you don't touch it, 0 .. 1
+    val circleX = p.getFloat("circle_x", 0.86f)
+    val circleY = p.getFloat("circle_y", 0.3f)
 
     companion object {
         fun prefs(ctx: Context): SharedPreferences = ctx.getSharedPreferences("cfg", Context.MODE_PRIVATE)
@@ -41,6 +46,6 @@ class Cfg(p: SharedPreferences) {
 
         /** keys that only change the look: no need to think again when they change */
         val LOOK_KEYS = setOf("arrow_style", "anim", "anim_speed", "arrow_size", "card_size", "opacity", "theme",
-            "handle_side", "handle_y", "sidebar")
+            "handle_side", "handle_y", "sidebar", "handle_mode", "handle_size", "handle_idle", "circle_x", "circle_y")
     }
 }
