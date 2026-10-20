@@ -143,6 +143,9 @@ class ChessService : Service() {
         }
 
         var board: Board? = null
+        var lastFrom: RectF? = null
+        var lastTo: RectF? = null
+        var lastText: String? = null
         var first = true
         say("open your chess app, reading in 6 seconds")
         try {
@@ -189,7 +192,12 @@ class ChessService : Service() {
                     val b: Board = when {
                         cur == null -> Game.newBoard(place, if (myTurnAtStart) iAmWhite else !iAmWhite)
                         place == Game.placement(cur) -> {
-                            rearm()
+                            // pieces didn't move (maybe you just tapped a piece). put our highlight back if it's still your turn
+                            val t = lastText
+                            if (t != null && (cur.sideToMove == Side.WHITE) == iAmWhite) {
+                                showMove(lastFrom, lastTo, t)
+                                rearm()
+                            }
                             continue
                         }
                         Game.track(cur, place) -> cur
@@ -203,21 +211,25 @@ class ChessService : Service() {
                     val myTurn = (b.sideToMove == Side.WHITE) == iAmWhite
                     if (!myTurn) {
                         say("waiting for the opponent...")
-                        rearm()
+                        lastText = null
+                        // no rearm here on purpose: if the opponent already moved while haiku was thinking,
+                        // the screen will differ from the shot we just read, and we want to catch that
                         continue
                     }
 
                     val best = engine?.bestMove(b.fen, 800)
                     if (best == null || best.length < 4) {
                         say("no move found, game over?")
-                        rearm()
                         continue
                     }
                     val fromSq = best.substring(0, 2)
                     val toSq = best.substring(2, 4)
                     val text = "$fromSq -> $toSq"
                     say("best move: $text")
-                    showMove(squareRect(fromSq), squareRect(toSq), text)
+                    lastFrom = squareRect(fromSq)
+                    lastTo = squareRect(toSq)
+                    lastText = text
+                    showMove(lastFrom, lastTo, text)
                     rearm()
                 } catch (e: InterruptedException) {
                     throw e
