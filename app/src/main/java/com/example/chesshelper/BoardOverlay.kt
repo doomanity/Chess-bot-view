@@ -12,6 +12,7 @@ class BoardOverlay(ctx: Context) : View(ctx) {
     private var from: RectF? = null
     private var to: RectF? = null
     private var label = ""
+    private val where = IntArray(2)
 
     private val fromPaint = Paint().apply { color = Color.argb(120, 255, 235, 59) }
     private val toPaint = Paint().apply { color = Color.argb(130, 76, 175, 80) }
@@ -34,6 +35,7 @@ class BoardOverlay(ctx: Context) : View(ctx) {
         isAntiAlias = true
     }
 
+    /** rectangles are in screen pixels (the same pixels as the screenshot) */
     fun showMove(f: RectF?, t: RectF?, text: String) {
         from = f
         to = t
@@ -43,6 +45,11 @@ class BoardOverlay(ctx: Context) : View(ctx) {
     }
 
     override fun onDraw(canvas: Canvas) {
+        // some phones put this window a little lower than the top of the screen (status bar, camera cutout).
+        // ask where we really are and move the drawing back so highlights land on the right squares.
+        getLocationOnScreen(where)
+        canvas.translate(-where[0].toFloat(), -where[1].toFloat())
+
         val f = from
         val t = to
         if (f != null && t != null) {

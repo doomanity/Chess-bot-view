@@ -24,14 +24,14 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.widget.Toast
-import com.github.bhlangonijr.chesslib.Board
 import com.github.bhlangonijr.chesslib.Side
 import java.io.File
-import kotlin.math.abs
 
 /**
  * the brain of the app. runs in the background:
- * watch the screen -> when the board changes, ask haiku to read it -> stockfish picks a move -> draw it on the overlay
+ * watch the screen -> find the board and see which squares have white / black pieces (locally, no ai)
+ * -> follow the game with the rules of chess -> stockfish picks a move -> draw it on the overlay.
+ * haiku is only asked when the game doesn't start from the normal position, when we lose track, or after a promotion.
  */
 class ChessService : Service() {
     private var projection: MediaProjection? = null
@@ -43,15 +43,12 @@ class ChessService : Service() {
     @Volatile private var running = false
 
     private var lastBmp: Bitmap? = null
-    private var lastThumb: IntArray? = null
+    @Volatile private var lastThumb: IntArray? = null
     private val main = Handler(Looper.getMainLooper())
     private lateinit var wm: WindowManager
     private var screenW = 0
     private var screenH = 0
 
-    private var box: FloatArray? = null          // board position found by haiku (fractions of the screen)
-    private var boxOverride: FloatArray? = null  // board position typed in by you, wins if set
-    private var whiteBottom = true
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -117,11 +114,29 @@ class ChessService : Service() {
             PixelFormat.TRANSLUCENT
         )
         lp.gravity = Gravity.TOP or Gravity.START
+        lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         wm.addView(ov, lp)
         overlay = ov
     }
 
     // ---------------------------------------------------------------- main loop
+
+    private class Frame(val px: IntArray, val geom: BoardGeom)
+
+    private var geomHint: BoardGeom? = null
+
+    /** grabs the screen and finds the board on it. null if there is no board on the screen right now */
+    private fun look(): Frame? {
+        val bmp = grab() ?: return null
+        val px = IntArray(bmp.width * bmp.height)
+        bmp.getPixels(px, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+        val g = BoardVision.findBoard(px, bmp.width, bmp.height, geomHint) ?: return null
+        geomHint = g
+        return Frame(px, g)
+    }
+
+    private fun screenOf(f: Frame): IntArray? =
+        BoardVision.classify(BoardVision.readSquares(f.px, screenW, f.geom))
 
     private fun loop() {
         val p = getSharedPreferences("cfg", MODE_PRIVATE)
@@ -129,8 +144,7 @@ class ChessService : Service() {
         val model = (p.getString("model", "claude-haiku-5-5") ?: "claude-haiku-5-5").trim()
         val iAmWhite = p.getString("color", "white") == "white"
         val myTurnAtStart = p.getBoolean("my_turn", true)
-        val elo = p.getInt("elo", 1500)
-        boxOverride = parseBox(p.getString("box", "") ?: "")
+        val elo = p.getInt("elo2", UciEngine.MAX_ELO)
 
         try {
             val e = UciEngine(File(applicationInfo.nativeLibraryDir, "libstockfish.so").absolutePath)
@@ -142,92 +156,116 @@ class ChessService : Service() {
             return
         }
 
-        var board: Board? = null
+        val tracker = Tracker(iAmWhite, myTurnAtStart)
         var lastFrom: RectF? = null
         var lastTo: RectF? = null
         var lastText: String? = null
-        var first = true
-        say("open your chess app, reading in 6 seconds")
+        say("open your chess app, reading in 5 seconds")
         try {
-            Thread.sleep(6000)
+            Thread.sleep(5000)
             while (running) {
                 try {
-                    val frame = grab()
-                    if (frame == null) {
-                        Thread.sleep(300)
+                    val f = look()
+                    if (f == null) {
+                        say("looking for the chess board...")
+                        lastThumb = null
+                        Thread.sleep(700)
                         continue
                     }
+                    val now = BoardVision.thumb(f.px, screenW, screenH, f.geom)
                     val prev = lastThumb
-                    if (!first && prev != null && !changed(prev, thumb(frame))) {
-                        Thread.sleep(400)
+                    if (prev != null && !BoardVision.changed(prev, now)) {
+                        Thread.sleep(350)
                         continue
                     }
 
-                    // something changed: hide our highlights, let the move animation finish, take a clean shot
+                    // something changed: hide our highlights and wait until the board stops moving
                     hideOverlay()
-                    Thread.sleep(if (first) 300L else 1000L)
-                    first = false
-                    val shot = grab() ?: continue
-                    lastThumb = thumb(shot)
-
-                    say("reading the board...")
-                    var reading: Reading? = null
-                    for (i in 1..3) {
-                        reading = Haiku.read(apiKey, model, shot)
-                        if (reading != null || Haiku.lastError.isNotEmpty()) break
+                    Thread.sleep(500)
+                    var shot = look() ?: continue
+                    for (i in 0 until 8) {
+                        Thread.sleep(250)
+                        val again = look() ?: break
+                        val same = !BoardVision.changed(
+                            BoardVision.thumb(shot.px, screenW, screenH, shot.geom),
+                            BoardVision.thumb(again.px, screenW, screenH, again.geom)
+                        )
+                        shot = again
+                        if (same) break
                     }
-                    if (reading == null) {
-                        val msg = if (Haiku.lastError.isNotEmpty()) Haiku.lastError
-                        else "couldn't read the board. " + Haiku.lastDebug
-                        say(msg)
-                        toast(msg)
+                    lastThumb = BoardVision.thumb(shot.px, screenW, screenH, shot.geom)
+
+                    val screen = screenOf(shot)
+                    if (screen == null) {
+                        say("can't tell the pieces apart on this screen")
                         continue
                     }
-                    val r: Reading = reading
-                    whiteBottom = r.whiteBottom
-                    if (r.box != null) box = r.box
-                    val place = r.placement
 
-                    val cur = board
-                    val b: Board = when {
-                        cur == null -> Game.newBoard(place, if (myTurnAtStart) iAmWhite else !iAmWhite)
-                        place == Game.placement(cur) -> {
-                            // pieces didn't move (maybe you just tapped a piece). put our highlight back if it's still your turn
-                            val t = lastText
-                            if (t != null && (cur.sideToMove == Side.WHITE) == iAmWhite) {
-                                showMove(lastFrom, lastTo, t)
-                                rearm()
-                            }
+                    var step = tracker.update(screen)
+                    if (step == Tracker.Step.RESYNC) {
+                        say("lost track of the game, reading it again")
+                        tracker.forget()
+                        step = tracker.update(screen)
+                    }
+                    if (step == Tracker.Step.NEED_AI || (tracker.needsVerify && step != Tracker.Step.UNREADABLE)) {
+                        val starting = step == Tracker.Step.NEED_AI
+                        say(if (starting) "reading the board with haiku..." else "checking the promoted piece...")
+                        var read: AiRead? = null
+                        for (i in 1..3) {
+                            read = Haiku.read(apiKey, model, shot.px, screenW, screenH, shot.geom)
+                            if (read != null || Haiku.lastError.isNotEmpty()) break
+                        }
+                        if (read == null) {
+                            val msg = if (Haiku.lastError.isNotEmpty()) Haiku.lastError
+                            else "couldn't read the board. " + HaikuParse.lastDebug
+                            say(msg)
+                            toast(msg)
+                            lastThumb = null
+                            Thread.sleep(2000)
                             continue
                         }
-                        Game.track(cur, place) -> cur
-                        else -> {
-                            say("lost track of the game, resyncing (assuming it's your turn)")
-                            Game.newBoard(place, iAmWhite)
+                        val ok = if (starting) tracker.supplyGrid(read.grid, read.bottomWhite, screen)
+                        else tracker.verifyWith(read.grid, screen)
+                        if (!ok) {
+                            if (starting) {
+                                say("haiku's board didn't match the screen, trying again")
+                                lastThumb = null
+                                Thread.sleep(1500)
+                                continue
+                            }
                         }
+                    } else if (step == Tracker.Step.UNREADABLE) {
+                        say("couldn't follow that, waiting for the next move")
+                        continue
                     }
-                    board = b
 
+                    val b = tracker.board ?: continue
+                    val wb = tracker.whiteBottom ?: iAmWhite
                     val myTurn = (b.sideToMove == Side.WHITE) == iAmWhite
                     if (!myTurn) {
                         say("waiting for the opponent...")
                         lastText = null
-                        // no rearm here on purpose: if the opponent already moved while haiku was thinking,
-                        // the screen will differ from the shot we just read, and we want to catch that
                         continue
                     }
 
-                    val best = engine?.bestMove(b.fen, 800)
-                    if (best == null || best.length < 4) {
+                    if (step == Tracker.Step.NO_CHANGE && lastText != null) {
+                        // nothing moved (maybe you just tapped a piece): put our highlight back
+                        showMove(lastFrom, lastTo, lastText!!)
+                        rearm()
+                        continue
+                    }
+
+                    val best = engine?.bestMove(b.fen, 1000)
+                    if (best == null || best.move.length < 4) {
                         say("no move found, game over?")
                         continue
                     }
-                    val fromSq = best.substring(0, 2)
-                    val toSq = best.substring(2, 4)
-                    val text = "$fromSq -> $toSq"
+                    val fromSq = best.move.substring(0, 2)
+                    val toSq = best.move.substring(2, 4)
+                    val text = "$fromSq -> $toSq  (${best.eval})"
                     say("best move: $text")
-                    lastFrom = squareRect(fromSq)
-                    lastTo = squareRect(toSq)
+                    lastFrom = squareRect(shot.geom, wb, fromSq)
+                    lastTo = squareRect(shot.geom, wb, toSq)
                     lastText = text
                     showMove(lastFrom, lastTo, text)
                     rearm()
@@ -244,10 +282,12 @@ class ChessService : Service() {
         }
     }
 
-    /** after we draw or wait, remember what the screen looks like so we only react to real changes */
+    /** after we draw, wait for the overlay to show up and ignore it in the next change check */
     private fun rearm() {
-        Thread.sleep(400)
-        grab()?.let { lastThumb = thumb(it) }
+        Thread.sleep(500)
+        val f = look() ?: return
+        // the next loop compares against a fresh thumbnail taken with the highlight on screen
+        lastThumb = BoardVision.thumb(f.px, screenW, screenH, f.geom)
     }
 
     // ---------------------------------------------------------------- screen capture
@@ -268,36 +308,6 @@ class ChessService : Service() {
         return lastBmp
     }
 
-    private fun effectiveBox(): FloatArray? = boxOverride ?: box
-
-    /** tiny grayscale copy of the board area (or the whole screen if we don't know where the board is) */
-    private fun thumb(b: Bitmap): IntArray {
-        var src = b
-        val bx = effectiveBox()
-        if (bx != null) {
-            val l = (bx[0] * b.width).toInt().coerceIn(0, b.width - 2)
-            val t = (bx[1] * b.height).toInt().coerceIn(0, b.height - 2)
-            val rr = (bx[2] * b.width).toInt().coerceIn(l + 1, b.width)
-            val bb = (bx[3] * b.height).toInt().coerceIn(t + 1, b.height)
-            if (rr - l >= 2 && bb - t >= 2) src = Bitmap.createBitmap(b, l, t, rr - l, bb - t)
-        }
-        val s = Bitmap.createScaledBitmap(src, 64, 64, true)
-        val px = IntArray(64 * 64)
-        s.getPixels(px, 0, 64, 0, 0, 64, 64)
-        if (s !== src) s.recycle()
-        if (src !== b) src.recycle()
-        return IntArray(px.size) { i ->
-            val c = px[i]
-            (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000
-        }
-    }
-
-    private fun changed(a: IntArray, b: IntArray): Boolean {
-        var n = 0
-        for (i in a.indices) if (abs(a[i] - b[i]) > 24) n++
-        return n.toFloat() / a.size > 0.003f
-    }
-
     // ---------------------------------------------------------------- overlay
 
     private fun hideOverlay() {
@@ -308,26 +318,15 @@ class ChessService : Service() {
         main.post { overlay?.showMove(f, t, text) }
     }
 
-    /** screen rectangle of a square like "e2", using the board position from haiku (or your override) */
-    private fun squareRect(sq: String): RectF? {
-        val bx = effectiveBox() ?: return null
+    /** screen rectangle of a square like "e2", from the board we found on the screen */
+    private fun squareRect(g: BoardGeom, whiteBottom: Boolean, sq: String): RectF? {
         val file = sq[0] - 'a'
         val rank = sq[1] - '1'
         if (file !in 0..7 || rank !in 0..7) return null
         val col = if (whiteBottom) file else 7 - file
         val row = if (whiteBottom) 7 - rank else rank
-        val left = bx[0] * screenW
-        val top = bx[1] * screenH
-        val w = (bx[2] - bx[0]) * screenW / 8f
-        val h = (bx[3] - bx[1]) * screenH / 8f
-        return RectF(left + col * w, top + row * h, left + (col + 1) * w, top + (row + 1) * h)
-    }
-
-    private fun parseBox(s: String): FloatArray? {
-        val nums = s.split(",").mapNotNull { it.trim().toFloatOrNull() }
-        if (nums.size != 4 || nums[2] <= nums[0] || nums[3] <= nums[1]) return null
-        if (!nums.all { it in 0f..1.02f }) return null
-        return nums.toFloatArray()
+        val s = g.size / 8f
+        return RectF(g.left + col * s, g.top + row * s, g.left + (col + 1) * s, g.top + (row + 1) * s)
     }
 
     // ---------------------------------------------------------------- notifications

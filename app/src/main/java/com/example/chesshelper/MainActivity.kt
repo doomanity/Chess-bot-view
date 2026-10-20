@@ -27,7 +27,6 @@ class MainActivity : Activity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var keyBox: EditText
     private lateinit var modelBox: EditText
-    private lateinit var boxBox: EditText
     private lateinit var white: RadioButton
     private lateinit var black: RadioButton
     private lateinit var myTurn: CheckBox
@@ -102,7 +101,7 @@ class MainActivity : Activity() {
         eloLabel = addText("")
         eloBar = SeekBar(this)
         eloBar.max = UciEngine.MAX_ELO - UciEngine.MIN_ELO
-        eloBar.progress = (prefs.getInt("elo", 1500) - UciEngine.MIN_ELO).coerceIn(0, eloBar.max)
+        eloBar.progress = (prefs.getInt("elo2", UciEngine.MAX_ELO) - UciEngine.MIN_ELO).coerceIn(0, eloBar.max)
         eloBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
                 updateEloLabel()
@@ -112,10 +111,6 @@ class MainActivity : Activity() {
         })
         root.addView(eloBar)
         updateEloLabel()
-
-        addText("board position override (optional)")
-        addText("only if the highlights land in the wrong place. left,top,right,bottom as fractions of the screen, like 0.02,0.30,0.98,0.72. leave empty for auto.", 12f)
-        boxBox = addInput(prefs.getString("box", "") ?: "", "0.02,0.30,0.98,0.72")
 
         addText("")
         addButton("1. allow draw over other apps") {
@@ -134,7 +129,7 @@ class MainActivity : Activity() {
 
     private fun updateEloLabel() {
         val elo = UciEngine.MIN_ELO + eloBar.progress
-        eloLabel.text = if (elo >= UciEngine.MAX_ELO) "difficulty: full power" else "difficulty: stockfish elo $elo"
+        eloLabel.text = if (elo >= UciEngine.MAX_ELO) "difficulty: full power (slide left to make it easier)" else "difficulty: stockfish elo $elo"
     }
 
     private fun save() {
@@ -143,8 +138,7 @@ class MainActivity : Activity() {
             .putString("model", modelBox.text.toString().trim().ifEmpty { "claude-haiku-5-5" })
             .putString("color", if (black.isChecked) "black" else "white")
             .putBoolean("my_turn", myTurn.isChecked)
-            .putInt("elo", UciEngine.MIN_ELO + eloBar.progress)
-            .putString("box", boxBox.text.toString().trim())
+            .putInt("elo2", UciEngine.MIN_ELO + eloBar.progress)
             .apply()
     }
 
