@@ -12,23 +12,27 @@ class Reading(val placement: String, val whiteBottom: Boolean, val box: FloatArr
 
 /** asks claude haiku to read the chessboard from a screenshot */
 object Haiku {
-    @Volatile var lastError: String = ""
+    @Volatile var lastError: String = ""   // api / network problem (stops the retries)
+    @Volatile var lastDebug: String = ""   // why a reply couldn't be used (shown to you)
 
-    private const val PROMPT = """This is a screenshot of a chess app. Find the chessboard and read where every piece is.
+    private const val PROMPT = """This is a screenshot of a chess app. Find the chessboard and read the pieces exactly as they appear on the screen.
 
-Go rank by rank, from rank 8 down to rank 1, as seen from White's side.
-If the board is flipped on screen (Black pieces at the bottom), still describe it from White's side.
-Write one short line per rank. Each rank must add up to 8 squares and there must be exactly one king per side.
+Write the board as 8 lines, from the top row of the screen to the bottom row. Each line has exactly 8 characters, from the left of the screen to the right, with no spaces and no labels.
+Use R N B Q K P for white pieces, r n b q k p for black pieces, and . for an empty square.
 
-Then finish with exactly these three lines and nothing after them:
-ORIENT: white_bottom   (write black_bottom instead if Black's pieces are at the bottom of the screen)
-BOX: left,top,right,bottom   (the outer edge of the 8x8 squares only, without coordinates or borders, as numbers from 0 to 1: fractions of the image width and height)
-FEN: the piece placement part of a FEN only. Uppercase = white, lowercase = black, digits = empty squares. Example: rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR
+After the 8 lines write exactly these two lines:
+BOTTOM: white
+BOX: left,top,right,bottom
 
-If you cannot see a full chessboard, write FEN: NONE"""
+BOTTOM says whose pieces start at the bottom of the screen: write white or black. If the rank numbers show 1 at the top, or the files run h to a from left to right, the board is flipped and black is at the bottom.
+BOX is the outer edge of the 8x8 squares only (no coordinates, no borders), as numbers from 0 to 1: fractions of the image width and height.
+
+If you cannot see a full chessboard, write only the word NONE.
+Do not write anything else."""
 
     fun read(apiKey: String, model: String, shot: Bitmap): Reading? {
         lastError = ""
+        lastDebug = ""
         try {
             val scale = minOf(1f, 1568f / maxOf(shot.width, shot.height))
             val img = if (scale < 1f) {
@@ -47,7 +51,7 @@ If you cannot see a full chessboard, write FEN: NONE"""
             val textBlock = JSONObject().put("type", "text").put("text", PROMPT)
             val body = JSONObject()
                 .put("model", model)
-                .put("max_tokens", 700)
+                .put("max_tokens", 1000)
                 .put("messages", JSONArray().put(JSONObject()
                     .put("role", "user")
                     .put("content", JSONArray().put(imageBlock).put(textBlock))))
@@ -83,11 +87,39 @@ If you cannot see a full chessboard, write FEN: NONE"""
         }
     }
 
+    private fun compress(row: String): String {
+        val sb = StringBuilder()
+        var n = 0
+        for (c in row) {
+            if (c == '.') {
+                n++
+            } else {
+                if (n > 0) { sb.append(n); n = 0 }
+                sb.append(c)
+            }
+        }
+        if (n > 0) sb.append(n)
+        return sb.toString()
+    }
+
+    /** turns haiku's 8 screen rows into a normal piece placement, flipping it if black is at the bottom */
     fun parse(reply: String): Reading? {
-        val fen = Regex("FEN:[\\s*`]*([prnbqkPRNBQK1-8/]+)").findAll(reply).lastOrNull()?.groupValues?.get(1)
-            ?: return null
-        if (!Game.isValidPlacement(fen)) return null
-        val whiteBottom = !Regex("ORIENT:[\\s*`]*black", RegexOption.IGNORE_CASE).containsMatchIn(reply)
+        val rowRegex = Regex("^[prnbqkPRNBQK.]{8}$")
+        val rows = reply.lines().map { it.trim().trim('`').trim() }.filter { rowRegex.matches(it) }
+        if (rows.size < 8) {
+            lastDebug = "no 8-row board in the reply: " + reply.trim().takeLast(140)
+            return null
+        }
+        val grid = rows.takeLast(8)
+        val whiteBottom = !Regex("BOTTOM:[\\s*`]*black", RegexOption.IGNORE_CASE).containsMatchIn(reply)
+        // a flipped board is turned 180 degrees: reverse the row order and each row
+        val ordered = if (whiteBottom) grid else grid.reversed().map { it.reversed() }
+        val placement = ordered.joinToString("/") { compress(it) }
+        if (!Game.isValidPlacement(placement)) {
+            lastDebug = "board didn't look like a real position: $placement"
+            return null
+        }
+
         val m = Regex("BOX:[\\s*`\\[]*([0-9.]+)\\s*,\\s*([0-9.]+)\\s*,\\s*([0-9.]+)\\s*,\\s*([0-9.]+)").find(reply)
         var box: FloatArray? = null
         if (m != null) {
@@ -96,6 +128,6 @@ If you cannot see a full chessboard, write FEN: NONE"""
                 box = nums.toFloatArray()
             }
         }
-        return Reading(fen, whiteBottom, box)
+        return Reading(placement, whiteBottom, box)
     }
 }

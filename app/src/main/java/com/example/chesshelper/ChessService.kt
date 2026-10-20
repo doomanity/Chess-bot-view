@@ -175,7 +175,7 @@ class ChessService : Service() {
                     }
                     if (reading == null) {
                         val msg = if (Haiku.lastError.isNotEmpty()) Haiku.lastError
-                        else "couldn't read a board, will try again when the screen changes"
+                        else "couldn't read the board. " + Haiku.lastDebug
                         say(msg)
                         toast(msg)
                         continue
