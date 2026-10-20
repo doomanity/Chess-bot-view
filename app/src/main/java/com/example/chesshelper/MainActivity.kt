@@ -155,8 +155,7 @@ class MainActivity : Activity() {
             return
         }
         if (!Settings.canDrawOverlays(this)) {
-            toast("allow 'draw over other apps' first (button 1)")
-            return
+            toast("overlay check says off, trying anyway")
         }
         val mpm = getSystemService(MediaProjectionManager::class.java)
         @Suppress("DEPRECATION")
