@@ -51,10 +51,29 @@ class Uci:
     def option(self, name, value):
         self.send(f"setoption name {name} value {value}")
 
-    def best(self, fen):
+    def best(self, fen, n=1):
+        """the move maia3 plays, plus (when n > 1) the n most likely human moves, most likely first"""
+        self.option("MultiPV", n)
         self.send("position fen " + fen)
         self.send("go nodes 1")  # maia3 answers with one forward pass
-        return self.wait("bestmove").split()[1]
+        found = {}
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError("engine stopped")
+            if line.startswith("info") and " multipv " in line and " pv " in line:
+                t = line.split()
+                try:
+                    found[int(t[t.index("multipv") + 1])] = t[t.index("pv") + 1]
+                except (ValueError, IndexError):
+                    pass
+            if line.startswith("bestmove"):
+                best = line.split()[1]
+                break
+        moves = [found[k] for k in sorted(found)]
+        if best in moves:
+            moves.remove(best)
+        return best, ([best] + moves)[:n]
 
     def close(self):
         try:
@@ -81,7 +100,7 @@ class Pool:
             cmd.append("--no-use-amp")
         return cmd
 
-    def move(self, fen, model, elo):
+    def move(self, fen, model, elo, n=1):
         with self.lock:
             key = (model, elo)
             if key != self.key:
@@ -98,7 +117,7 @@ class Pool:
                 self.engine.wait("readyok")
                 self.key = key
             try:
-                return self.engine.best(fen)
+                return self.engine.best(fen, n)
             except Exception:
                 self.key = None  # the engine died (bad position?), start a fresh one next time
                 raise
@@ -135,9 +154,10 @@ def make_handler(pool, default_model, default_elo):
                 fen = req["fen"]
                 model = str(req.get("model") or default_model)
                 elo = int(req.get("elo") or default_elo)
-                mv = pool.move(fen, model, elo)
-                print(f"{fen}  ->  {mv}")
-                self.reply(200, {"move": mv})
+                n = max(1, min(8, int(req.get("n") or 1)))
+                mv, moves = pool.move(fen, model, elo, n)
+                print(f"{fen}  ->  {' '.join(moves)}")
+                self.reply(200, {"move": mv, "moves": moves})
             except Exception as e:
                 print("error:", e)
                 self.reply(500, {"error": str(e)})

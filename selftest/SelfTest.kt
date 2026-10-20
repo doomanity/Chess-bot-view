@@ -373,6 +373,53 @@ fun engineTest(sf: UciEngine) {
     check(m?.move == "h5f7", "stockfish should find Qxf7#")
 }
 
+fun adviceTest(sf: UciEngine) {
+    println("== move advice")
+    // reading engine output
+    val l1 = UciInfo.parse("info depth 12 seldepth 15 multipv 2 score cp -34 nodes 1000 nps 5000 time 20 pv e7e5 g1f3")
+    check(l1 != null && l1.multipv == 2 && l1.move == "e7e5" && l1.cp == -34 && l1.mate == null, "cp info line not parsed")
+    val l2 = UciInfo.parse("info depth 9 multipv 1 score mate 3 nodes 5 pv h5f7")
+    check(l2 != null && l2.mate == 3 && l2.move == "h5f7", "mate info line not parsed")
+    check(UciInfo.parse("info depth 5 score cp 10 lowerbound pv e2e4") == null, "bound line should be skipped")
+    check(Grade.of(0) == Grade.BEST && Grade.of(50) == Grade.DECENT && Grade.of(120) == Grade.OK && Grade.of(400) == Grade.BLUNDER, "grade thresholds")
+
+    val start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    check(Game.san(start, "e2e4") == "e4" && Game.san(start, "g1f3") == "Nf3", "short move notation: ${Game.san(start, "g1f3")}")
+    check(Game.san("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", "e1g1") == "O-O", "castling notation: ${Game.san("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", "e1g1")}")
+    check(Game.san(start, "zzzz") == "zzzz", "unknown move falls back")
+    val adv = Advisor(sf, null)
+    val fen = "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq - 0 1"
+    val c = adv.advise(fen, 4, 300)
+    println("  after 1.d4: " + c.joinToString { "${it.move} ${it.text} g${it.grade}" })
+    check(c.size == 4, "wanted 4 moves, got ${c.size}")
+    check(c.map { it.move }.distinct().size == c.size, "moves repeat")
+    check(c.firstOrNull()?.grade == Grade.BEST, "the top move should be graded best")
+    val b = boardOf(fen)
+    check(c.all { m -> b.legalMoves().any { it.toString() == m.move } }, "an advised move is not legal")
+
+    // scholar's mate: the mate is best, a quiet move is a blunder (and the likely moves of another engine get graded too)
+    val mateFen = "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4"
+    val fake = object : MoveLister { override fun topMoves(fen: String, n: Int) = listOf("a2a3", "h5f7") }
+    val c2 = Advisor(sf, fake).advise(mateFen, 3, 300)
+    println("  scholar's mate with a2a3 suggested by 'maia': " + c2.joinToString { "${it.move} ${it.text} g${it.grade}" })
+    check(c2.size == 3 && c2[0].move == "a2a3" && c2[0].grade == Grade.BLUNDER, "a move that misses mate in one must be a blunder")
+    check(c2.any { it.move == "h5f7" && it.grade == Grade.BEST && it.text == "M1" }, "the mate should be best and show M1")
+
+    // a lister that fails: we still get advice from stockfish and the error is reported
+    val broken = object : MoveLister { override fun topMoves(fen: String, n: Int): List<String> = throw java.io.IOException("no route") }
+    val adv3 = Advisor(sf, broken)
+    val c3 = adv3.advise(fen, 2, 300)
+    check(c3.size == 2 && adv3.listerError == "no route", "fallback when the pc can't be reached")
+
+    // weak difficulty: its own pick goes first, still graded
+    val weak = UciEngine(System.getProperty("sf") ?: "")
+    weak.configure(1350)
+    val c4 = Advisor(weak, null).advise(fen, 3, 300)
+    println("  difficulty 1350: " + c4.joinToString { "${it.move} ${it.text} g${it.grade}" })
+    check(c4.size == 3, "weak engine advice")
+    weak.close()
+}
+
 fun main(args: Array<String>) {
     val fixtures = args[0]
     val sfPath = args[1]
@@ -390,6 +437,7 @@ fun main(args: Array<String>) {
     simulate("small phone", true, looks[0], sf, 60, 7, size = 800, w = 900, h = 1900, left = 50, top = 400)
     simulate("big tablet black", false, looks[2], sf, 60, 8, size = 1600, w = 1800, h = 2560, left = 100, top = 400)
     engineTest(sf)
+    adviceTest(sf)
     sf.close()
     println(if (failures == 0) "\nALL TESTS PASSED" else "\n$failures FAILURE(S)")
     if (failures > 0) System.exit(1)

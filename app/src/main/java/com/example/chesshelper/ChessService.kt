@@ -39,8 +39,9 @@ class ChessService : Service() {
     private var vdisplay: VirtualDisplay? = null
     private var reader: ImageReader? = null
     private var overlay: BoardOverlay? = null
-    private var engine: MoveEngine? = null
+    private var advisor: Advisor? = null
     private var stockfish: UciEngine? = null
+    private var remote: RemoteEngine? = null
     private var worker: Thread? = null
     @Volatile private var running = false
 
@@ -56,11 +57,11 @@ class ChessService : Service() {
     private var prevThumb: IntArray? = null
     private var lastCls: IntArray? = null         // piece colors at the last frame we processed
     private var overlayShown = false
-    private var overlayIdx = intArrayOf(-1, -1)  // screen squares under the highlight
+    private var overlayIdx = IntArray(0)          // screen squares under the highlights
     private var shownFen: String? = null
-    private var shownFrom: RectF? = null
-    private var shownTo: RectF? = null
-    private var shownText: String? = null
+    private var shownMoves: List<DrawMove> = emptyList()
+    private var shownBoard: RectF? = null
+    private var nMoves = 3
     private var aiCalls = 0
     private var aiBlockedUntil = 0L
     private var engineName = "stockfish"
@@ -203,6 +204,7 @@ class ChessService : Service() {
         val maiaHost = (p.getString("maia_host", "") ?: "").trim()
         val maiaModel = (p.getString("maia_model", "23m") ?: "23m").trim().ifEmpty { "23m" }
         val maiaElo = p.getInt("maia_elo", 1500)
+        nMoves = p.getInt("n_moves", 3).coerceIn(1, 4)
 
         try {
             val sf = UciEngine(File(applicationInfo.nativeLibraryDir, "libstockfish.so").absolutePath)
@@ -214,12 +216,12 @@ class ChessService : Service() {
             return
         }
         if (useMaia && maiaHost.isNotEmpty()) {
-            engine = RemoteEngine(maiaHost, maiaModel, maiaElo)
+            remote = RemoteEngine(maiaHost, maiaModel, maiaElo)
             engineName = "maia3"
         } else {
-            engine = stockfish
             engineName = "stockfish"
         }
+        advisor = Advisor(stockfish!!, remote)
 
         val tracker = Tracker(iAmWhite, myTurnAtStart)
         var moving = false
@@ -289,7 +291,7 @@ class ChessService : Service() {
         val last = lastCls ?: return false
         val cls = BoardVision.classify(BoardVision.readSquares(f.px, f.w, f.local)) ?: return false
         for (i in 0 until 64) {
-            if (i == overlayIdx[0] || i == overlayIdx[1]) {
+            if (i in overlayIdx) {
                 // under our highlight the color can look different, but a piece appearing or leaving is real
                 if ((cls[i] != BoardVision.EMPTY) != (last[i] != BoardVision.EMPTY)) return false
             } else if (cls[i] != last[i]) {
@@ -368,30 +370,30 @@ class ChessService : Service() {
 
         val fen = b.fen
         val g = f.abs
-        if (shownFen == fen && shownText != null) {
-            showMove(shownFrom, shownTo, shownText!!, g, wb)
+        if (shownFen == fen && shownMoves.isNotEmpty()) {
+            showMoves(shownMoves, shownBoard ?: RectF(g.left.toFloat(), g.top.toFloat(), (g.left + g.size).toFloat(), (g.top + g.size).toFloat()))
             return step
         }
-        val best = try {
-            engine?.bestMove(fen, 800)
-        } catch (e: IOException) {
-            // maia3 on the pc isn't reachable: stockfish takes over for this move
-            toast("maia3 pc not reachable (${e.message}), using stockfish")
-            stockfish?.bestMove(fen, 800)
-        }
-        if (best == null || best.move.length < 4) {
+        say("thinking...")
+        val adv = advisor ?: return step
+        val cands = adv.advise(fen, nMoves)
+        adv.listerError?.let { toast("maia3 pc not reachable ($it), using stockfish") }
+        if (cands.isEmpty()) {
             say("no move found, game over?")
             return step
         }
-        val fromSq = best.move.substring(0, 2)
-        val toSq = best.move.substring(2, 4)
-        val text = "$fromSq -> $toSq  (${best.eval})"
-        say("best move: $text")
+        val moves = ArrayList<DrawMove>()
+        for (c in cands) {
+            val fromRect = squareRect(g, wb, c.move.substring(0, 2)) ?: continue
+            val toRect = squareRect(g, wb, c.move.substring(2, 4)) ?: continue
+            moves.add(DrawMove(fromRect, toRect, c.grade, c.rank, Game.san(fen, c.move), c.text))
+        }
+        val boardRect = RectF(g.left.toFloat(), g.top.toFloat(), (g.left + g.size).toFloat(), (g.top + g.size).toFloat())
+        say("best: " + cands.joinToString("  ") { "${Game.san(fen, it.move)} ${it.text}" })
         shownFen = fen
-        shownFrom = squareRect(g, wb, fromSq)
-        shownTo = squareRect(g, wb, toSq)
-        shownText = text
-        showMove(shownFrom, shownTo, text, g, wb)
+        shownMoves = moves
+        shownBoard = boardRect
+        showMoves(moves, boardRect)
         return step
     }
 
@@ -405,17 +407,15 @@ class ChessService : Service() {
     private fun hideMove() {
         if (!overlayShown) return
         overlayShown = false
-        overlayIdx = intArrayOf(-1, -1)
+        overlayIdx = IntArray(0)
         main.post { overlay?.clearMove() }
     }
 
-    private fun showMove(f: RectF?, t: RectF?, text: String, g: BoardGeom, wb: Boolean) {
-        val y = maxOf(150f, g.top - 100f)
+    private fun showMoves(moves: List<DrawMove>, boardRect: RectF) {
         overlayShown = true
-        if (f != null && t != null) {
-            overlayIdx = intArrayOf(screenIndexOf(f, g), screenIndexOf(t, g))
-        }
-        main.post { overlay?.setMove(f, t, text, y) }
+        val g = BoardGeom(boardRect.left.toInt(), boardRect.top.toInt(), boardRect.width().toInt())
+        overlayIdx = moves.flatMap { listOf(screenIndexOf(it.from, g), screenIndexOf(it.to, g)) }.distinct().toIntArray()
+        main.post { overlay?.setMoves(moves, boardRect) }
         // wait until our highlight is in the picture, so it isn't mistaken for a change on the board
         Thread.sleep(350)
         look()?.let { prevThumb = thumbOf(it) }
@@ -482,7 +482,7 @@ class ChessService : Service() {
         try { projection?.stop() } catch (_: Exception) {}
         try { reader?.close() } catch (_: Exception) {}
         stockfish?.close()
-        engine?.close()
+        remote?.close()
         super.onDestroy()
     }
 }

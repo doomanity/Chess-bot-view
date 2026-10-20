@@ -32,6 +32,8 @@ class MainActivity : Activity() {
     private lateinit var myTurn: CheckBox
     private lateinit var eloBar: SeekBar
     private lateinit var eloLabel: TextView
+    private lateinit var movesBar: SeekBar
+    private lateinit var movesLabel: TextView
     private lateinit var engineStockfish: RadioButton
     private lateinit var engineMaia: RadioButton
     private lateinit var maiaHostBox: EditText
@@ -117,6 +119,20 @@ class MainActivity : Activity() {
         root.addView(eloBar)
         updateEloLabel()
 
+        movesLabel = addText("")
+        movesBar = SeekBar(this)
+        movesBar.max = 3
+        movesBar.progress = (prefs.getInt("n_moves", 3) - 1).coerceIn(0, 3)
+        movesBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                movesLabel.text = "moves shown: ${p + 1} (dark green = best, light green = decent, yellow = acceptable, red skull = blunder)"
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        root.addView(movesBar)
+        movesLabel.text = "moves shown: ${movesBar.progress + 1} (dark green = best, light green = decent, yellow = acceptable, red skull = blunder)"
+
         addText("engine")
         val engineGroup = RadioGroup(this)
         engineGroup.orientation = RadioGroup.HORIZONTAL
@@ -167,6 +183,7 @@ class MainActivity : Activity() {
             .putString("color", if (black.isChecked) "black" else "white")
             .putBoolean("my_turn", myTurn.isChecked)
             .putInt("elo2", UciEngine.MIN_ELO + eloBar.progress)
+            .putInt("n_moves", movesBar.progress + 1)
             .putString("engine", if (engineMaia.isChecked) "maia3" else "stockfish")
             .putString("maia_host", maiaHostBox.text.toString().trim().removePrefix("http://"))
             .putString("maia_model", maiaModelBox.text.toString().trim().ifEmpty { "23m" })

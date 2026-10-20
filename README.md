@@ -15,7 +15,7 @@ github builds it for you. open the Actions tab and wait for the build (about 5 t
 1. open the app, paste your claude api key, pick your side and difficulty
 2. tap "1. allow draw over other apps" and turn it on
 3. tap "2. start" and allow screen capture
-4. open your chess app. after a few seconds the best move is highlighted (green = where to, yellow = which piece, label shows the eval)
+4. open your chess app. after a few seconds it shows 1 to 4 moves (you pick how many in the app) as arrows with a small list: dark green = best, light green = decent, yellow = acceptable, red with a skull = blunder. the numbers are stockfish's evaluation at full power, for both engines
 5. stop it from the app or from the notification
 
 ## maia3 (optional, runs on your pc)

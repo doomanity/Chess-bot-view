@@ -71,6 +71,20 @@ object Game {
         return b
     }
 
+    /** a move in the usual short notation (Nf3, exd5, O-O). falls back to the plain move like g1f3 */
+    fun san(fen: String, uci: String): String {
+        return try {
+            val b = Board()
+            b.loadFromFen(fen)
+            val mv = b.legalMoves().firstOrNull { it.toString() == uci } ?: return uci
+            val list = com.github.bhlangonijr.chesslib.move.MoveList(fen)
+            list.add(mv)
+            list.toSanArray()[0]
+        } catch (e: Exception) {
+            uci
+        }
+    }
+
     fun placement(b: Board): String = b.fen.substringBefore(' ')
 
     // ------------------------------------------------------------------ occupancy (which squares have a white / black piece)
