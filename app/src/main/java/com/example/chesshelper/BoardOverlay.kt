@@ -3,22 +3,60 @@ package com.example.chesshelper
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
+import android.os.SystemClock
 import android.view.View
+import kotlin.math.PI
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.sin
 
 /** one suggested move to draw: where it goes (screen pixel rectangles), how good it is, and what the list says */
-class DrawMove(val from: RectF, val to: RectF, val grade: Int, val rank: Int, val label: String, val eval: String)
+class DrawMove(
+    val from: RectF, val to: RectF, val grade: Int, val rank: Int, val label: String, val eval: String,
+    val star: Boolean = false
+)
+
+/** one move of the main line after the best move (n = 1 is the opponent's reply, then us, then them) */
+class LineStep(val from: RectF, val to: RectF, val n: Int, val mine: Boolean)
+
+/** everything to draw for one position */
+class OverlayModel(
+    val moves: List<DrawMove>,
+    val board: RectF,
+    val whiteBottom: Boolean,
+    val evalShare: Float? = null,     // 0..1 white part of the eval bar, null = no bar
+    val evalText: String? = null,
+    val threatFrom: RectF? = null,
+    val threatTo: RectF? = null,
+    val line: List<LineStep> = emptyList(),
+    val title: String = ""
+)
+
+/** how to draw: style, colors, animation, sizes */
+class OverlayLook(
+    val style: String, val accent: Int, val anim: Boolean, val speed: Float,
+    val arrowSize: Float, val cardSize: Float, val opacity: Float
+) {
+    /** how long the entrance animation runs (the board reader waits this long before it looks again) */
+    val totalMs: Long get() = if (anim) ((DRAW_MS + GLOW_MS) / speed).toLong() else 0L
+
+    companion object {
+        const val DRAW_MS = 380f
+        const val GLOW_MS = 900f
+    }
+}
 
 /** transparent full-screen layer that draws the suggested moves on top of the chess app */
 class BoardOverlay(ctx: Context) : View(ctx) {
-    private var moves: List<DrawMove> = emptyList()
-    private var board = RectF()
+    private var model: OverlayModel? = null
+    private var look = OverlayLook("neon", Color.rgb(0, 229, 255), true, 1f, 1f, 1f, 0.95f)
+    private var start = 0L
+    private var lastShare = 0.5f
     private var debug = ""
     private val where = IntArray(2)
     private val d = ctx.resources.displayMetrics.density
@@ -26,37 +64,40 @@ class BoardOverlay(ctx: Context) : View(ctx) {
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
     private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
-    private val card = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(225, 18, 28, 44)
-        setShadowLayer(14f * d, 0f, 3f * d, Color.argb(120, 0, 0, 0))
-    }
+    private val card = Paint(Paint.ANTI_ALIAS_FLAG)
     private val debugPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(200, 255, 255, 255)
-        textSize = 12f * d
+        color = Color.argb(170, 255, 255, 255)
+        textSize = 11f * d
         textAlign = Paint.Align.CENTER
         setShadowLayer(4f, 0f, 0f, Color.BLACK)
     }
 
-    private fun colorOf(grade: Int, alpha: Int = 255): Int {
-        val c = when (grade) {
-            Grade.BEST -> Color.rgb(27, 138, 58)       // dark green
-            Grade.DECENT -> Color.rgb(139, 212, 80)    // light green
-            Grade.OK -> Color.rgb(242, 197, 17)        // yellow
-            else -> Color.rgb(229, 57, 53)             // red
-        }
-        return Color.argb(alpha, Color.red(c), Color.green(c), Color.blue(c))
+    private fun gradeColor(m: DrawMove): Int = if (m.star) Theme.GOLD else gradeColor(m.grade)
+
+    private fun gradeColor(grade: Int): Int = when (grade) {
+        Grade.BEST -> Color.rgb(0, 200, 83)        // dark green
+        Grade.DECENT -> Color.rgb(140, 230, 90)    // light green
+        Grade.OK -> Color.rgb(255, 214, 0)         // yellow
+        else -> Color.rgb(255, 45, 70)             // red
     }
 
-    /** rectangles are in screen pixels (the same pixels as the screenshot). boardRect is the whole board */
-    fun setMoves(list: List<DrawMove>, boardRect: RectF) {
-        moves = list
-        board = boardRect
+    fun setLook(l: OverlayLook) {
+        look = l
+        alpha = l.opacity
+        invalidate()
+    }
+
+    fun setModel(m: OverlayModel) {
+        model?.let { old -> old.evalShare?.let { lastShare = it } }
+        model = m
+        start = SystemClock.uptimeMillis()
         invalidate()
     }
 
     fun clearMove() {
-        if (moves.isEmpty()) return
-        moves = emptyList()
+        if (model == null) return
+        model?.evalShare?.let { lastShare = it }
+        model = null
         invalidate()
     }
 
@@ -67,6 +108,19 @@ class BoardOverlay(ctx: Context) : View(ctx) {
         invalidate()
     }
 
+    // ------------------------------------------------------------------ animation
+
+    private fun ease(x: Float): Float {
+        val t = x.coerceIn(0f, 1f)
+        return 1f - (1f - t) * (1f - t) * (1f - t)
+    }
+
+    /** 0..1 how far the arrows are drawn in */
+    private var drawP = 1f
+
+    /** extra glow while the new moves pulse, 1 = normal */
+    private var glow = 1f
+
     override fun onDraw(canvas: Canvas) {
         // some phones put this window a little lower than the top of the screen (status bar, camera cutout).
         // ask where we really are and move the drawing back so highlights land on the right squares.
@@ -74,79 +128,201 @@ class BoardOverlay(ctx: Context) : View(ctx) {
         canvas.translate(-where[0].toFloat(), -where[1].toFloat())
         val screenW = (width + where[0]).toFloat()
 
-        // the worst first, so the best move is drawn on top
-        for (m in moves.sortedByDescending { it.rank }) drawMove(canvas, m)
-        if (moves.isNotEmpty()) drawCard(canvas, screenW)
-        if (debug.isNotEmpty()) canvas.drawText(debug, screenW / 2f, (height + where[1]) - 40f * d, debugPaint)
+        val m = model
+        if (m != null) {
+            val t = (SystemClock.uptimeMillis() - start) * look.speed
+            if (look.anim) {
+                drawP = ease(t / OverlayLook.DRAW_MS)
+                val g = (t - OverlayLook.DRAW_MS) / OverlayLook.GLOW_MS
+                glow = if (g in 0f..1f) 1f + 0.45f * sin(g * 2f * PI.toFloat()).let { it * it } else 1f
+                if (t < OverlayLook.DRAW_MS + OverlayLook.GLOW_MS) postInvalidateOnAnimation()
+            } else {
+                drawP = 1f
+                glow = 1f
+            }
+
+            if (m.evalShare != null) drawEvalBar(canvas, m, screenW)
+            for (s in m.line) drawLineStep(canvas, s)
+            if (m.threatFrom != null && m.threatTo != null) drawThreat(canvas, m.threatFrom, m.threatTo)
+            // the worst first, so the best move is drawn on top
+            for (mv in m.moves.sortedByDescending { it.rank }) drawMove(canvas, mv)
+            if (m.moves.isNotEmpty()) drawCard(canvas, m, screenW)
+        }
+        if (debug.isNotEmpty()) canvas.drawText(debug, screenW / 2f, (height + where[1]) - 36f * d, debugPaint)
     }
+
+    // ------------------------------------------------------------------ neon helpers
+
+    private val neon get() = look.style == "neon"
+
+    /** a line that glows (neon) or a plain one */
+    private fun glowLine(c: Canvas, x0: Float, y0: Float, x1: Float, y1: Float, col: Int, w: Float, alpha: Float = 1f, dash: Boolean = false) {
+        stroke.strokeCap = Paint.Cap.ROUND
+        stroke.pathEffect = if (dash) DashPathEffect(floatArrayOf(w * 1.6f, w * 1.4f), 0f) else null
+        if (neon) {
+            stroke.color = Theme.withAlpha(col, (28 * glow * alpha).toInt())
+            stroke.strokeWidth = w * 3.4f
+            c.drawLine(x0, y0, x1, y1, stroke)
+            stroke.color = Theme.withAlpha(col, (70 * glow * alpha).toInt())
+            stroke.strokeWidth = w * 2.0f
+            c.drawLine(x0, y0, x1, y1, stroke)
+        }
+        stroke.color = Theme.withAlpha(col, (235 * alpha).toInt())
+        stroke.strokeWidth = w
+        c.drawLine(x0, y0, x1, y1, stroke)
+        if (neon) {
+            stroke.color = Theme.withAlpha(Theme.core(col), (210 * alpha).toInt())
+            stroke.strokeWidth = w * 0.38f
+            c.drawLine(x0, y0, x1, y1, stroke)
+        }
+        stroke.pathEffect = null
+    }
+
+    private fun glowRing(c: Canvas, r: RectF, col: Int, w: Float, radius: Float) {
+        if (neon) {
+            stroke.color = Theme.withAlpha(col, (40 * glow).toInt())
+            stroke.strokeWidth = w * 3f
+            c.drawRoundRect(r, radius, radius, stroke)
+        }
+        stroke.color = col
+        stroke.strokeWidth = w
+        c.drawRoundRect(r, radius, radius, stroke)
+        if (neon) {
+            stroke.color = Theme.withAlpha(Theme.core(col), 200)
+            stroke.strokeWidth = w * 0.35f
+            c.drawRoundRect(r, radius, radius, stroke)
+        }
+    }
+
+    private fun glowFillPath(c: Canvas, p: Path, col: Int, alpha: Float = 1f) {
+        if (neon) {
+            stroke.color = Theme.withAlpha(col, (55 * glow * alpha).toInt())
+            stroke.strokeWidth = 10f * d * look.arrowSize
+            stroke.strokeJoin = Paint.Join.ROUND
+            c.drawPath(p, stroke)
+        }
+        fill.color = Theme.withAlpha(col, (240 * alpha).toInt())
+        c.drawPath(p, fill)
+    }
+
+    // ------------------------------------------------------------------ pieces of the drawing
 
     private fun drawMove(c: Canvas, m: DrawMove) {
         val sq = m.to.width()
-        val col = colorOf(m.grade)
+        val col = gradeColor(m)
+        val rad = sq * 0.12f
+        val minimal = look.style == "minimal"
 
-        // the piece to pick up: a frame (a light fill too for the first choice)
+        // the piece to pick up
         if (m.rank == 1) {
-            fill.color = colorOf(m.grade, 60)
-            c.drawRoundRect(m.from, sq * 0.1f, sq * 0.1f, fill)
+            fill.color = Theme.withAlpha(col, (55 * drawP).toInt())
+            c.drawRoundRect(m.from, rad, rad, fill)
         }
-        stroke.color = col
-        stroke.strokeWidth = sq * 0.055f
-        c.drawRoundRect(RectF(m.from).apply { inset(sq * 0.03f, sq * 0.03f) }, sq * 0.1f, sq * 0.1f, stroke)
+        glowRing(c, RectF(m.from).apply { inset(sq * 0.05f, sq * 0.05f) }, Theme.withAlpha(col, (230 * drawP).toInt()), sq * 0.045f * look.arrowSize, rad)
 
         // where it goes
-        fill.color = colorOf(m.grade, if (m.rank == 1) 105 else 80)
-        c.drawRoundRect(m.to, sq * 0.1f, sq * 0.1f, fill)
-        stroke.strokeWidth = sq * 0.07f
-        c.drawRoundRect(RectF(m.to).apply { inset(sq * 0.035f, sq * 0.035f) }, sq * 0.1f, sq * 0.1f, stroke)
+        fill.color = Theme.withAlpha(col, ((if (m.rank == 1) 95 else 70) * drawP).toInt())
+        c.drawRoundRect(m.to, rad, rad, fill)
+        glowRing(c, RectF(m.to).apply { inset(sq * 0.05f, sq * 0.05f) }, Theme.withAlpha(col, (255 * drawP).toInt()), sq * 0.06f * look.arrowSize, rad)
 
-        arrow(c, m, col, sq)
+        if (minimal) {
+            fill.color = Theme.withAlpha(col, (230 * drawP).toInt())
+            c.drawCircle(m.to.centerX(), m.to.centerY(), sq * 0.13f * look.arrowSize * drawP, fill)
+        } else {
+            arrow(c, m.from, m.to, col, sq * (if (m.rank == 1) 0.15f else 0.1f) * look.arrowSize, 1f, false)
+        }
 
-        // rank badge (top right) and skull for a blunder (bottom right)
-        val r = sq * 0.17f
-        badge(c, m.to.right - r * 1.1f, m.to.top + r * 1.1f, r, col)
-        text.textSize = r * 1.35f
-        text.textAlign = Paint.Align.CENTER
-        text.color = if (m.grade == Grade.DECENT || m.grade == Grade.OK) Color.BLACK else Color.WHITE
-        c.drawText(m.rank.toString(), m.to.right - r * 1.1f, m.to.top + r * 1.1f + r * 0.47f, text)
-        text.color = Color.WHITE
-        if (m.grade == Grade.BLUNDER) skull(c, m.to.right - r * 1.1f, m.to.bottom - r * 1.1f, r * 1.15f)
+        // rank badge (top right), skull for a blunder or star for a max power move (bottom right)
+        val r = sq * 0.16f * drawP
+        if (r > 1f) {
+            val bx = m.to.right - sq * 0.19f
+            val by = m.to.top + sq * 0.19f
+            badge(c, bx, by, r, col)
+            text.textSize = r * 1.3f
+            text.textAlign = Paint.Align.CENTER
+            text.isFakeBoldText = true
+            text.color = if (m.grade == Grade.DECENT || m.grade == Grade.OK || m.star) Color.BLACK else Color.WHITE
+            c.drawText(if (m.star) "★" else m.rank.toString(), bx, by + r * 0.46f, text)
+            text.isFakeBoldText = false
+            text.color = Color.WHITE
+            if (m.grade == Grade.BLUNDER && !m.star) skull(c, m.to.right - sq * 0.2f, m.to.bottom - sq * 0.2f, r * 1.1f)
+        }
     }
 
-    private fun arrow(c: Canvas, m: DrawMove, col: Int, sq: Float) {
-        val x0 = m.from.centerX()
-        val y0 = m.from.centerY()
-        val x1 = m.to.centerX()
-        val y1 = m.to.centerY()
+    private fun arrow(c: Canvas, from: RectF, to: RectF, col: Int, width: Float, alpha: Float, dash: Boolean) {
+        val sq = to.width()
+        val x0 = from.centerX()
+        val y0 = from.centerY()
+        val x1 = to.centerX()
+        val y1 = to.centerY()
         val len = hypot(x1 - x0, y1 - y0)
         if (len < sq * 0.4f) return
         val ux = (x1 - x0) / len
         val uy = (y1 - y0) / len
-        val width = sq * if (m.rank == 1) 0.17f else 0.11f
-        val head = sq * 0.36f
-        val sx = x0 + ux * sq * 0.22f
-        val sy = y0 + uy * sq * 0.22f
-        val ex = x1 - ux * sq * 0.08f
-        val ey = y1 - uy * sq * 0.08f
+        val head = maxOf(width * 2.3f, sq * 0.26f)
+        val sx = x0 + ux * sq * 0.2f
+        val sy = y0 + uy * sq * 0.2f
+        val full = len - sq * 0.28f
+        val reach = full * drawP
+        val ex = sx + ux * reach
+        val ey = sy + uy * reach
         val bx = ex - ux * head
         val by = ey - uy * head
-        stroke.color = Color.argb(235, Color.red(col), Color.green(col), Color.blue(col))
-        stroke.strokeWidth = width
-        stroke.strokeCap = Paint.Cap.ROUND
-        c.drawLine(sx, sy, bx, by, stroke)
-        stroke.strokeCap = Paint.Cap.BUTT
+        if (reach > head) glowLine(c, sx, sy, bx, by, col, width, alpha, dash)
         val a = atan2(uy, ux)
-        val half = head * 0.62f
+        val half = head * 0.6f
         val p = Path()
         p.moveTo(ex, ey)
-        p.lineTo(bx + (-sin(a)) * half, by + cos(a) * half)
-        p.lineTo(bx - (-sin(a)) * half, by - cos(a) * half)
+        p.lineTo(bx - sin(a) * half, by + cos(a) * half)
+        p.lineTo(bx + sin(a) * half, by - cos(a) * half)
         p.close()
-        fill.color = Color.argb(235, Color.red(col), Color.green(col), Color.blue(col))
-        c.drawPath(p, fill)
+        glowFillPath(c, p, col, alpha)
+    }
+
+    private fun drawLineStep(c: Canvas, s: LineStep) {
+        val sq = s.to.width()
+        val col = if (s.mine) look.accent else Color.rgb(205, 210, 225)
+        val w = sq * 0.065f * look.arrowSize
+        if (look.style != "minimal") arrow(c, s.from, s.to, col, w, 0.55f, !s.mine)
+        val r = sq * 0.12f * drawP
+        if (r > 1f) {
+            val bx = s.to.left + sq * 0.17f
+            val by = s.to.top + sq * 0.17f
+            fill.color = Color.argb(200, 15, 20, 32)
+            c.drawCircle(bx, by, r * 1.15f, fill)
+            stroke.color = Theme.withAlpha(col, 200)
+            stroke.strokeWidth = r * 0.18f
+            c.drawCircle(bx, by, r, stroke)
+            text.textSize = r * 1.15f
+            text.textAlign = Paint.Align.CENTER
+            text.color = col
+            c.drawText((s.n + 1).toString(), bx, by + r * 0.42f, text)
+            text.color = Color.WHITE
+        }
+    }
+
+    private fun drawThreat(c: Canvas, from: RectF, to: RectF) {
+        val sq = to.width()
+        arrow(c, from, to, Theme.THREAT, sq * 0.08f * look.arrowSize, 0.85f, true)
+        val r = sq * 0.14f * drawP
+        if (r > 1f) {
+            val bx = to.left + sq * 0.18f
+            val by = to.bottom - sq * 0.18f
+            badge(c, bx, by, r, Theme.THREAT)
+            text.textSize = r * 1.4f
+            text.textAlign = Paint.Align.CENTER
+            text.isFakeBoldText = true
+            c.drawText("!", bx, by + r * 0.5f, text)
+            text.isFakeBoldText = false
+        }
     }
 
     private fun badge(c: Canvas, cx: Float, cy: Float, r: Float, col: Int) {
-        fill.color = Color.argb(230, 255, 255, 255)
+        if (neon) {
+            fill.color = Theme.withAlpha(col, (60 * glow).toInt())
+            c.drawCircle(cx, cy, r * 1.55f, fill)
+        }
+        fill.color = Color.argb(235, 255, 255, 255)
         c.drawCircle(cx, cy, r * 1.12f, fill)
         fill.color = col
         c.drawCircle(cx, cy, r, fill)
@@ -154,14 +330,19 @@ class BoardOverlay(ctx: Context) : View(ctx) {
 
     /** a little skull on a red disc */
     private fun skull(c: Canvas, cx: Float, cy: Float, r: Float) {
+        val red = Color.rgb(255, 45, 70)
+        if (neon) {
+            fill.color = Theme.withAlpha(red, (70 * glow).toInt())
+            c.drawCircle(cx, cy, r * 1.6f, fill)
+        }
         fill.color = Color.WHITE
         c.drawCircle(cx, cy, r * 1.08f, fill)
-        fill.color = Color.rgb(229, 57, 53)
+        fill.color = red
         c.drawCircle(cx, cy, r, fill)
         fill.color = Color.WHITE
         c.drawCircle(cx, cy - r * 0.12f, r * 0.58f, fill)
         c.drawRoundRect(RectF(cx - r * 0.32f, cy + r * 0.2f, cx + r * 0.32f, cy + r * 0.72f), r * 0.1f, r * 0.1f, fill)
-        fill.color = Color.rgb(229, 57, 53)
+        fill.color = red
         c.drawCircle(cx - r * 0.23f, cy - r * 0.1f, r * 0.17f, fill)
         c.drawCircle(cx + r * 0.23f, cy - r * 0.1f, r * 0.17f, fill)
         val nose = Path()
@@ -170,42 +351,136 @@ class BoardOverlay(ctx: Context) : View(ctx) {
         nose.lineTo(cx + r * 0.09f, cy + r * 0.24f)
         nose.close()
         c.drawPath(nose, fill)
-        stroke.color = Color.rgb(229, 57, 53)
+        stroke.color = red
         stroke.strokeWidth = r * 0.07f
+        stroke.pathEffect = null
         c.drawLine(cx - r * 0.1f, cy + r * 0.45f, cx - r * 0.1f, cy + r * 0.72f, stroke)
         c.drawLine(cx + r * 0.1f, cy + r * 0.45f, cx + r * 0.1f, cy + r * 0.72f, stroke)
     }
 
-    /** the list of moves: rank, move, eval, skull for a blunder. above the board if there is room, else below it */
-    private fun drawCard(c: Canvas, screenW: Float) {
-        val rowH = 38f * d
-        val pad = 10f * d
-        val w = minOf(board.width(), screenW - 24f * d).coerceAtLeast(240f * d)
-        val h = moves.size * rowH + pad * 2
-        val left = (board.left + (board.width() - w) / 2f).coerceIn(8f * d, screenW - w - 8f * d)
-        var top = board.top - h - 14f * d
-        if (top < 56f * d) top = board.bottom + 14f * d
-        c.drawRoundRect(RectF(left, top, left + w, top + h), 18f * d, 18f * d, card)
+    /** who is winning: a bar next to the board (or above it when there is no room on the side) */
+    private fun drawEvalBar(c: Canvas, m: OverlayModel, screenW: Float) {
+        val share = lastShare + (m.evalShare!! - lastShare) * drawP
+        val b = m.board
+        val w = 9f * d * look.cardSize
+        val gap = 4f * d
+        val vertical = b.left >= w + gap * 2
+        val rect = if (vertical) RectF(b.left - gap - w, b.top, b.left - gap, b.bottom)
+        else RectF(b.left, b.top - gap - w, b.right, b.top - gap)
+        val rad = w / 2f
+        // outline glow in the accent color
+        if (neon) {
+            stroke.color = Theme.withAlpha(look.accent, (60 * glow).toInt())
+            stroke.strokeWidth = w * 0.9f
+            c.drawRoundRect(rect, rad, rad, stroke)
+        }
+        fill.color = Color.rgb(28, 30, 36)
+        c.drawRoundRect(rect, rad, rad, fill)
+        fill.color = Color.rgb(240, 242, 245)
+        val whiteRect = if (vertical) {
+            val hW = rect.height() * share
+            if (m.whiteBottom) RectF(rect.left, rect.bottom - hW, rect.right, rect.bottom)
+            else RectF(rect.left, rect.top, rect.right, rect.top + hW)
+        } else {
+            val wW = rect.width() * share
+            if (m.whiteBottom) RectF(rect.left, rect.top, rect.left + wW, rect.bottom)
+            else RectF(rect.right - wW, rect.top, rect.right, rect.bottom)
+        }
+        c.save()
+        c.clipRect(whiteRect)
+        c.drawRoundRect(rect, rad, rad, fill)
+        c.restore()
+        stroke.color = Theme.withAlpha(look.accent, 220)
+        stroke.strokeWidth = 1.5f * d
+        c.drawRoundRect(rect, rad, rad, stroke)
 
-        for ((i, m) in moves.sortedBy { it.rank }.withIndex()) {
-            val cy = top + pad + rowH * i + rowH / 2f
-            val col = colorOf(m.grade)
-            fill.color = col
-            c.drawCircle(left + pad + rowH * 0.36f, cy, rowH * 0.31f, fill)
-            text.textSize = rowH * 0.42f
-            text.textAlign = Paint.Align.CENTER
-            text.color = if (m.grade == Grade.DECENT || m.grade == Grade.OK) Color.BLACK else Color.WHITE
-            c.drawText(m.rank.toString(), left + pad + rowH * 0.36f, cy + rowH * 0.15f, text)
-            text.color = Color.WHITE
-            text.textSize = rowH * 0.52f
+        val label = m.evalText ?: return
+        text.textSize = 11f * d * look.cardSize
+        text.textAlign = Paint.Align.CENTER
+        val tw = text.measureText(label) + 10f * d
+        val th = 18f * d * look.cardSize
+        val whiteWinning = share >= 0.5f
+        val (cx, cy) = if (vertical) {
+            val atBottom = whiteWinning == m.whiteBottom
+            Pair(rect.centerX().coerceAtLeast(tw / 2f + 2f), if (atBottom) rect.bottom + th * 0.75f else rect.top - th * 0.75f)
+        } else {
+            Pair(rect.centerX(), rect.top - th * 0.75f)
+        }
+        val pill = RectF(cx - tw / 2f, cy - th / 2f, cx + tw / 2f, cy + th / 2f)
+        fill.color = if (whiteWinning) Color.rgb(240, 242, 245) else Color.rgb(28, 30, 36)
+        c.drawRoundRect(pill, th / 2f, th / 2f, fill)
+        stroke.strokeWidth = 1.2f * d
+        c.drawRoundRect(pill, th / 2f, th / 2f, stroke)
+        text.color = if (whiteWinning) Color.BLACK else Color.WHITE
+        c.drawText(label, cx, cy + text.textSize * 0.36f, text)
+        text.color = Color.WHITE
+    }
+
+    /** the list of moves: rank, move, eval, skull for a blunder. above the board if there is room, else below it */
+    private fun drawCard(c: Canvas, m: OverlayModel, screenW: Float) {
+        val k = look.cardSize
+        val rowH = 34f * d * k
+        val pad = 10f * d * k
+        val head = if (m.title.isNotEmpty()) 22f * d * k else 0f
+        val board = m.board
+        val w = minOf(board.width(), screenW - 24f * d).coerceAtLeast(220f * d)
+        val h = m.moves.size * rowH + pad * 2 + head
+        val left = (board.left + (board.width() - w) / 2f).coerceIn(8f * d, maxOf(8f * d, screenW - w - 8f * d))
+        val evalAbove = m.evalShare != null && board.left < 9f * d * k + 8f * d
+        var top = board.top - h - (if (evalAbove) 30f else 14f) * d
+        if (top < 56f * d) top = board.bottom + 14f * d
+        val slide = (1f - drawP) * 16f * d
+        val rect = RectF(left, top + slide, left + w, top + h + slide)
+        val radius = 18f * d * k
+
+        if (neon) {
+            stroke.color = Theme.withAlpha(look.accent, (50 * glow).toInt())
+            stroke.strokeWidth = 8f * d
+            c.drawRoundRect(rect, radius, radius, stroke)
+        }
+        card.color = Theme.panel(look.accent, (232 * drawP).toInt())
+        c.drawRoundRect(rect, radius, radius, card)
+        stroke.color = Theme.withAlpha(look.accent, (200 * drawP).toInt())
+        stroke.strokeWidth = 1.5f * d
+        c.drawRoundRect(rect, radius, radius, stroke)
+
+        var y0 = rect.top + pad
+        if (head > 0f) {
+            text.textSize = 11f * d * k
             text.textAlign = Paint.Align.LEFT
-            c.drawText(m.label, left + pad + rowH * 0.95f, cy + rowH * 0.18f, text)
-            text.textAlign = Paint.Align.RIGHT
-            text.color = Color.argb(230, 220, 228, 240)
-            val ex = left + w - pad - (if (m.grade == Grade.BLUNDER) rowH * 0.9f else 0f)
-            c.drawText(m.eval, ex, cy + rowH * 0.18f, text)
+            text.color = Theme.withAlpha(look.accent, 230)
+            text.letterSpacing = 0.12f
+            c.drawText(m.title.uppercase(), rect.left + pad + 4f * d, y0 + head * 0.62f, text)
+            text.letterSpacing = 0f
             text.color = Color.WHITE
-            if (m.grade == Grade.BLUNDER) skull(c, left + w - pad - rowH * 0.34f, cy, rowH * 0.34f)
+            y0 += head
+        }
+        for ((i, mv) in m.moves.sortedBy { it.rank }.withIndex()) {
+            val cy = y0 + rowH * i + rowH / 2f
+            val col = gradeColor(mv)
+            val dotX = rect.left + pad + rowH * 0.36f
+            if (neon) {
+                fill.color = Theme.withAlpha(col, (55 * glow).toInt())
+                c.drawCircle(dotX, cy, rowH * 0.42f, fill)
+            }
+            fill.color = col
+            c.drawCircle(dotX, cy, rowH * 0.3f, fill)
+            text.textSize = rowH * 0.4f
+            text.textAlign = Paint.Align.CENTER
+            text.isFakeBoldText = true
+            text.color = if (mv.grade == Grade.DECENT || mv.grade == Grade.OK || mv.star) Color.BLACK else Color.WHITE
+            c.drawText(if (mv.star) "★" else mv.rank.toString(), dotX, cy + rowH * 0.14f, text)
+            text.isFakeBoldText = false
+            text.color = Color.WHITE
+            text.textSize = rowH * 0.5f
+            text.textAlign = Paint.Align.LEFT
+            c.drawText(mv.label, rect.left + pad + rowH * 0.95f, cy + rowH * 0.18f, text)
+            text.textAlign = Paint.Align.RIGHT
+            text.color = Color.argb(220, 210, 220, 235)
+            val ex = rect.right - pad - (if (mv.grade == Grade.BLUNDER && !mv.star) rowH * 0.9f else 0f)
+            c.drawText(mv.eval, ex, cy + rowH * 0.18f, text)
+            text.color = Color.WHITE
+            if (mv.grade == Grade.BLUNDER && !mv.star) skull(c, rect.right - pad - rowH * 0.34f, cy, rowH * 0.32f)
         }
     }
 }

@@ -18,6 +18,10 @@ github builds it for you. open the Actions tab and wait for the build (about 5 t
 4. open your chess app. after a few seconds it shows 1 to 4 moves (you pick how many in the app) as arrows with a small list: dark green = best, light green = decent, yellow = acceptable, red with a skull = blunder. the numbers are stockfish's evaluation at full power, for both engines
 5. stop it from the app or from the notification
 
+## side bar (quick menu while playing)
+
+touch the right (or left) edge of the screen: a thin glowing bar shows up. slide it towards the middle and the quick menu opens: your side, engine, strength, moves shown, eval bar / threat / best line, arrow style, effects, theme, rethink, max power (stockfish at full power for one move, a few saves per game) and new game. drag the bar up or down to move it. it hides itself when you don't touch it.
+
 ## maia3 (optional, runs on your pc)
 
 on your pc (phone and pc on the same wifi):

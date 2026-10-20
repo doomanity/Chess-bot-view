@@ -9,7 +9,7 @@ import com.github.bhlangonijr.chesslib.Side
  * The AI is only needed to read a game that doesn't start from the normal position, or if we are completely lost
  * and can't recognize the pieces ourselves.
  */
-class Tracker(private val iAmWhite: Boolean, private val myTurnAtStart: Boolean) {
+class Tracker(var iAmWhite: Boolean, private val myTurnAtStart: Boolean) {
     enum class Step { NEED_AI, STARTED, NO_CHANGE, MOVED, UNREADABLE, RESYNC, RESET }
 
     /** what the pieces of this chess app look like, learned from a position we are sure about */

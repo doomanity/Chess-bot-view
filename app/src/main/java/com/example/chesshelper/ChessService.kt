@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
@@ -17,28 +18,29 @@ import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Handler
-import android.os.SystemClock
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.WindowManager
 import android.widget.Toast
 import com.github.bhlangonijr.chesslib.Side
 import java.io.File
-import java.io.IOException
 
 /**
  * the brain of the app. runs in the background, in real time and without the AI:
  * look at the screen a few times a second -> find the board and see which squares have white / black pieces
- * -> follow the game with the rules of chess (and the piece shapes it learned) -> the engine picks a move
- * -> draw it on the overlay. haiku is only asked when the game doesn't start from the normal position,
+ * -> follow the game with the rules of chess (and the piece shapes it learned) -> the engines pick and grade moves
+ * -> draw them on the overlay. haiku is only asked when the game doesn't start from the normal position,
  * or when the app is completely lost and can't recognize the pieces itself.
+ * the side bar (an invisible handle on the screen edge) opens a quick menu to change settings while playing.
  */
-class ChessService : Service() {
+class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenceChangeListener {
     private var projection: MediaProjection? = null
     private var vdisplay: VirtualDisplay? = null
     private var reader: ImageReader? = null
     private var overlay: BoardOverlay? = null
+    private var sideBar: SideBar? = null
     private var advisor: Advisor? = null
     private var stockfish: UciEngine? = null
     private var remote: RemoteEngine? = null
@@ -51,20 +53,33 @@ class ChessService : Service() {
     private var screenW = 0
     private var screenH = 0
 
+    // settings, and requests from the side menu (set on the main thread, handled by the worker)
+    @Volatile private var cfg: Cfg? = null
+    @Volatile private var engineDirty = false
+    @Volatile private var wantRethink = false
+    @Volatile private var wantSave = false
+    @Volatile private var wantNewGame = false
+    @Volatile private var wantRead = false
+    @Volatile private var panelOpen = false
+    @Volatile private var savesLeft = 3
+    @Volatile private var lastSaid = ""
+
     // what we know about the screen
     private var geom: BoardGeom? = null           // the board, in screen pixels
     private var region = IntArray(0)              // pixels of the board area (reused every frame)
-    private var prevThumb: IntArray? = null
+    @Volatile private var prevThumb: IntArray? = null
     private var lastCls: IntArray? = null         // piece colors at the last frame we processed
     private var overlayShown = false
-    private var overlayIdx = IntArray(0)          // screen squares under the highlights
+    private var overlaySquares = IntArray(0)      // screen squares our highlights start or end on
+    private var overlayCrossed = IntArray(0)      // squares our arrows only pass over
     private var shownFen: String? = null
-    private var shownMoves: List<DrawMove> = emptyList()
-    private var shownBoard: RectF? = null
-    private var nMoves = 3
+    private var shownModel: OverlayModel? = null
     private var aiCalls = 0
     private var aiBlockedUntil = 0L
     private var engineName = "stockfish"
+    private var tracker: Tracker? = null
+
+    private enum class Mode { NORMAL, RETHINK, SAVE }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -101,6 +116,9 @@ class ChessService : Service() {
         val bounds = wm.maximumWindowMetrics.bounds
         screenW = bounds.width()
         screenH = bounds.height()
+        val c = Cfg.load(this)
+        cfg = c
+        savesLeft = c.savesPerGame
 
         val mpm = getSystemService(MediaProjectionManager::class.java)
         val p = mpm.getMediaProjection(code, data)
@@ -119,6 +137,7 @@ class ChessService : Service() {
         )
 
         val ov = BoardOverlay(this)
+        ov.setLook(lookOf(c))
         val lp = WindowManager.LayoutParams(
             screenW, screenH,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -132,6 +151,74 @@ class ChessService : Service() {
         lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         wm.addView(ov, lp)
         overlay = ov
+
+        if (c.sidebar) {
+            val sb = SideBar(this, wm, this)
+            sb.show()
+            sideBar = sb
+        }
+        Cfg.prefs(this).registerOnSharedPreferenceChangeListener(this)
+    }
+
+    private fun lookOf(c: Cfg) = OverlayLook(c.style, Theme.accent(this, c.theme), c.anim, c.animSpeed, c.arrowSize, c.cardSize, c.opacity)
+
+    // ---------------------------------------------------------------- settings and the side menu
+
+    override fun onSharedPreferenceChanged(p: SharedPreferences?, key: String?) {
+        val c = Cfg.load(this)
+        cfg = c
+        if (key != null && key in Cfg.LOOK_KEYS) {
+            overlay?.setLook(lookOf(c))
+            shownModel?.let { if (overlayShown) overlay?.setModel(it) }
+            if (key == "sidebar" || key == "theme" || key == "handle_side") {
+                val sb = sideBar
+                if (c.sidebar && sb == null) {
+                    sideBar = SideBar(this, wm, this).also { it.show() }
+                } else {
+                    sb?.refresh()
+                    if (!c.sidebar) sideBar = null
+                }
+            }
+        } else {
+            engineDirty = true // the worker applies it (the engines belong to its thread)
+        }
+    }
+
+    override fun onRethink() { wantRethink = true }
+
+    override fun onMaxPower() {
+        if (savesLeft == 0) toast("no max power saves left this game") else wantSave = true
+    }
+
+    override fun onNewGame() { wantNewGame = true }
+
+    override fun onStopHelper() { main.post { stopSelf() } }
+
+    override fun onPanelOpen(open: Boolean) {
+        panelOpen = open
+        if (!open) {
+            prevThumb = null
+            wantRead = true
+        }
+    }
+
+    override fun status(): String = "$engineName · ${lastSaid.ifEmpty { "starting" }}"
+
+    override fun savesLeft(): Int = savesLeft
+
+    /** applies changed settings on the worker thread */
+    private fun applyEngineSettings() {
+        val c = Cfg.load(this)
+        cfg = c
+        val sf = stockfish ?: return
+        if (sf.elo != c.elo) sf.configure(c.elo)
+        remote?.close()
+        remote = if (c.useMaia && c.maiaHost.isNotEmpty()) RemoteEngine(c.maiaHost, c.maiaModel, c.maiaElo) else null
+        engineName = if (remote != null) "maia3 ${c.maiaElo}" else if (c.elo < UciEngine.MAX_ELO) "stockfish ${c.elo}" else "stockfish"
+        advisor = Advisor(sf, remote)
+        tracker?.iAmWhite = c.iAmWhite
+        shownFen = null
+        wantRead = true
     }
 
     // ---------------------------------------------------------------- screen capture
@@ -159,7 +246,7 @@ class ChessService : Service() {
         return wide
     }
 
-    /** the board area of the screen: pixels plus where the board is inside them. g is in screen pixels */
+    /** the board area of the screen: pixels plus where the board is inside them. abs is in screen pixels */
     private class Frame(val px: IntArray, val w: Int, val h: Int, val local: BoardGeom, val abs: BoardGeom)
 
     private fun regionFrame(bmp: Bitmap, g: BoardGeom): Frame? {
@@ -194,36 +281,20 @@ class ChessService : Service() {
     // ---------------------------------------------------------------- main loop
 
     private fun loop() {
-        val p = getSharedPreferences("cfg", MODE_PRIVATE)
-        val apiKey = (p.getString("api_key", "") ?: "").trim()
-        val model = (p.getString("model", "claude-haiku-5-5") ?: "claude-haiku-5-5").trim()
-        val iAmWhite = p.getString("color", "white") == "white"
-        val myTurnAtStart = p.getBoolean("my_turn", true)
-        val elo = p.getInt("elo2", UciEngine.MAX_ELO)
-        val useMaia = p.getString("engine", "stockfish") == "maia3"
-        val maiaHost = (p.getString("maia_host", "") ?: "").trim()
-        val maiaModel = (p.getString("maia_model", "23m") ?: "23m").trim().ifEmpty { "23m" }
-        val maiaElo = p.getInt("maia_elo", 1500)
-        nMoves = p.getInt("n_moves", 3).coerceIn(1, 4)
-
+        val c0 = cfg ?: Cfg.load(this)
         try {
             val sf = UciEngine(File(applicationInfo.nativeLibraryDir, "libstockfish.so").absolutePath)
-            sf.configure(elo)
+            sf.configure(c0.elo)
             stockfish = sf
         } catch (e: Exception) {
             toast("stockfish failed to start: ${e.message}")
-            stopSelf()
+            main.post { stopSelf() }
             return
         }
-        if (useMaia && maiaHost.isNotEmpty()) {
-            remote = RemoteEngine(maiaHost, maiaModel, maiaElo)
-            engineName = "maia3"
-        } else {
-            engineName = "stockfish"
-        }
-        advisor = Advisor(stockfish!!, remote)
+        applyEngineSettings()
+        val tr = Tracker(c0.iAmWhite, c0.myTurnAtStart)
+        tracker = tr
 
-        val tracker = Tracker(iAmWhite, myTurnAtStart)
         var moving = false
         var lastRead = 0L
         var lastStep = Tracker.Step.UNREADABLE
@@ -233,6 +304,25 @@ class ChessService : Service() {
             Thread.sleep(2500)
             while (running) {
                 try {
+                    if (engineDirty) {
+                        engineDirty = false
+                        applyEngineSettings()
+                    }
+                    if (panelOpen) {
+                        // the menu covers the screen: don't read it, just wait
+                        Thread.sleep(200)
+                        continue
+                    }
+                    if (wantNewGame) {
+                        wantNewGame = false
+                        tr.forget()
+                        savesLeft = cfg?.savesPerGame ?: 3
+                        shownFen = null
+                        hideMove()
+                        wantRead = true
+                        say("new game: reading the board again")
+                    }
+
                     val now = SystemClock.elapsedRealtime()
                     val f = look()
                     if (f == null) {
@@ -245,6 +335,17 @@ class ChessService : Service() {
                         continue
                     }
                     lostBoardSince = 0L
+
+                    if (wantRethink || wantSave) {
+                        val mode = if (wantSave) Mode.SAVE else Mode.RETHINK
+                        wantRethink = false
+                        wantSave = false
+                        shownFen = null
+                        lastRead = now
+                        lastStep = process(f, tr, now, mode)
+                        continue
+                    }
+
                     val thumb = thumbOf(f)
                     val prev = prevThumb
                     prevThumb = thumb
@@ -264,14 +365,16 @@ class ChessService : Service() {
                     }
 
                     // the picture is calm. read it when something moved, or again while we can't make sense of it
-                    val due = moving || prev == null || (lastStep == Tracker.Step.UNREADABLE && now - lastRead >= 700)
+                    val due = moving || prev == null || wantRead ||
+                        (lastStep == Tracker.Step.UNREADABLE && now - lastRead >= 700)
                     if (!due) {
                         Thread.sleep(POLL)
                         continue
                     }
                     moving = false
+                    wantRead = false
                     lastRead = now
-                    lastStep = process(f, tracker, now, apiKey, model, iAmWhite)
+                    lastStep = process(f, tr, now, Mode.NORMAL)
                     Thread.sleep(POLL)
                 } catch (e: InterruptedException) {
                     throw e
@@ -286,12 +389,13 @@ class ChessService : Service() {
         }
     }
 
-    /** true if the only changes are the ones that don't matter: hint dots, a selected piece, our own highlight */
+    /** true if the only changes are the ones that don't matter: hint dots, a selected piece, our own drawing */
     private fun justCosmetic(f: Frame): Boolean {
         val last = lastCls ?: return false
         val cls = BoardVision.classify(BoardVision.readSquares(f.px, f.w, f.local)) ?: return false
         for (i in 0 until 64) {
-            if (i in overlayIdx) {
+            if (i in overlayCrossed) continue // our arrows pass over these, we can't read them now
+            if (i in overlaySquares) {
                 // under our highlight the color can look different, but a piece appearing or leaving is real
                 if ((cls[i] != BoardVision.EMPTY) != (last[i] != BoardVision.EMPTY)) return false
             } else if (cls[i] != last[i]) {
@@ -301,11 +405,12 @@ class ChessService : Service() {
         return true
     }
 
-    /** reads the board in this calm frame, follows the game, and shows the best move if it is our turn */
-    private fun process(first: Frame, tracker: Tracker, now: Long, apiKey: String, model: String, iAmWhite: Boolean): Tracker.Step {
+    /** reads the board in this calm frame, follows the game, and shows the best moves if it is our turn */
+    private fun process(first: Frame, tracker: Tracker, now: Long, mode: Mode): Tracker.Step {
+        val c = cfg ?: Cfg.load(this)
         var f = first
         if (overlayShown) {
-            // our own highlight would be part of the picture
+            // our own drawing would be part of the picture
             hideMove()
             Thread.sleep(250)
             f = look() ?: return Tracker.Step.UNREADABLE
@@ -318,6 +423,7 @@ class ChessService : Service() {
         }
         lastCls = cls
         var step = tracker.update(cls, reads, now)
+        if (step == Tracker.Step.STARTED) savesLeft = c.savesPerGame
 
         if (step == Tracker.Step.NEED_AI || step == Tracker.Step.RESYNC || (tracker.needsVerify && step != Tracker.Step.UNREADABLE)) {
             val starting = step == Tracker.Step.NEED_AI || step == Tracker.Step.RESYNC
@@ -330,7 +436,7 @@ class ChessService : Service() {
             var read: AiRead? = null
             aiCalls++
             for (i in 1..2) {
-                read = Haiku.read(apiKey, model, shot)
+                read = Haiku.read(c.apiKey, c.model, shot)
                 if (read != null || Haiku.lastError.isNotEmpty()) break
             }
             shot.recycle()
@@ -349,6 +455,7 @@ class ChessService : Service() {
                     return Tracker.Step.UNREADABLE
                 }
                 step = Tracker.Step.STARTED
+                savesLeft = c.savesPerGame
             } else {
                 tracker.verifyWith(read.grid, cls, reads)
             }
@@ -360,45 +467,76 @@ class ChessService : Service() {
 
         debugLine(tracker, step)
         val b = tracker.board ?: return step
-        val wb = tracker.whiteBottom ?: iAmWhite
-        val myTurn = (b.sideToMove == Side.WHITE) == iAmWhite
+        val wb = tracker.whiteBottom ?: c.iAmWhite
+        val myTurn = (b.sideToMove == Side.WHITE) == c.iAmWhite
         if (!myTurn) {
             say("waiting for the opponent...")
+            if (mode != Mode.NORMAL) toast("it's the opponent's turn")
             shownFen = null
             return step
         }
 
         val fen = b.fen
         val g = f.abs
-        if (shownFen == fen && shownMoves.isNotEmpty()) {
-            showMoves(shownMoves, shownBoard ?: RectF(g.left.toFloat(), g.top.toFloat(), (g.left + g.size).toFloat(), (g.top + g.size).toFloat()))
+        val cached = shownModel
+        if (mode == Mode.NORMAL && shownFen == fen && cached != null) {
+            showModel(cached)
             return step
         }
-        say("thinking...")
         val adv = advisor ?: return step
-        val cands = adv.advise(fen, nMoves)
+        say(when (mode) {
+            Mode.SAVE -> "max power: thinking hard..."
+            Mode.RETHINK -> "thinking again..."
+            else -> "thinking..."
+        })
+        val ms = if (mode == Mode.RETHINK) (c.thinkMs * 2.5f).toInt() else c.thinkMs
+        val advice = adv.full(fen, c.nMoves, ms, threat = c.showThreat, maxPower = mode == Mode.SAVE)
         adv.listerError?.let { toast("maia3 pc not reachable ($it), using stockfish") }
-        if (cands.isEmpty()) {
+        if (advice.cands.isEmpty()) {
             say("no move found, game over?")
             return step
         }
+        if (mode == Mode.SAVE && savesLeft > 0) savesLeft--
+
+        fun rect(sq: String) = squareRect(g, wb, sq)
         val moves = ArrayList<DrawMove>()
-        for (c in cands) {
-            val fromRect = squareRect(g, wb, c.move.substring(0, 2)) ?: continue
-            val toRect = squareRect(g, wb, c.move.substring(2, 4)) ?: continue
-            moves.add(DrawMove(fromRect, toRect, c.grade, c.rank, Game.san(fen, c.move), c.text))
+        for (cand in advice.cands) {
+            val fr = rect(cand.move.substring(0, 2)) ?: continue
+            val to = rect(cand.move.substring(2, 4)) ?: continue
+            moves.add(DrawMove(fr, to, cand.grade, cand.rank, Game.san(fen, cand.move), cand.text, cand.star))
         }
+        val line = ArrayList<LineStep>()
+        if (c.showLine && advice.cands.firstOrNull()?.move == advice.lineFor) {
+            for ((i, mv) in advice.line.withIndex()) {
+                val fr = rect(mv.substring(0, 2)) ?: break
+                val to = rect(mv.substring(2, 4)) ?: break
+                line.add(LineStep(fr, to, i + 1, i % 2 == 1))
+            }
+        }
+        val th = advice.threat
         val boardRect = RectF(g.left.toFloat(), g.top.toFloat(), (g.left + g.size).toFloat(), (g.top + g.size).toFloat())
-        say("best: " + cands.joinToString("  ") { "${Game.san(fen, it.move)} ${it.text}" })
+        val title = when {
+            mode == Mode.SAVE -> "max power" + (if (savesLeft >= 0) " · $savesLeft left" else "")
+            else -> engineName
+        }
+        val model = OverlayModel(
+            moves, boardRect, wb,
+            evalShare = if (c.showEval) advice.whiteShare else null,
+            evalText = if (c.showEval) advice.evalText else null,
+            threatFrom = th?.let { rect(it.move.substring(0, 2)) },
+            threatTo = th?.let { rect(it.move.substring(2, 4)) },
+            line = line,
+            title = title
+        )
+        say("best: " + advice.cands.joinToString("  ") { "${Game.san(fen, it.move)} ${it.text}" })
         shownFen = fen
-        shownMoves = moves
-        shownBoard = boardRect
-        showMoves(moves, boardRect)
+        shownModel = model
+        showModel(model)
         return step
     }
 
     private fun debugLine(tracker: Tracker, step: Tracker.Step) {
-        val text = "$step ${tracker.lastPlies}p | shapes ${tracker.templates.known}/12 | off ${tracker.lastTypeMismatch} | ai $aiCalls | $engineName"
+        val text = "$step ${tracker.lastPlies}p · shapes ${tracker.templates.known}/12 · off ${tracker.lastTypeMismatch} · ai $aiCalls · $engineName"
         main.post { overlay?.setDebug(text) }
     }
 
@@ -407,25 +545,44 @@ class ChessService : Service() {
     private fun hideMove() {
         if (!overlayShown) return
         overlayShown = false
-        overlayIdx = IntArray(0)
+        overlaySquares = IntArray(0)
+        overlayCrossed = IntArray(0)
         main.post { overlay?.clearMove() }
     }
 
-    private fun showMoves(moves: List<DrawMove>, boardRect: RectF) {
+    private fun showModel(m: OverlayModel) {
         overlayShown = true
-        val g = BoardGeom(boardRect.left.toInt(), boardRect.top.toInt(), boardRect.width().toInt())
-        overlayIdx = moves.flatMap { listOf(screenIndexOf(it.from, g), screenIndexOf(it.to, g)) }.distinct().toIntArray()
-        main.post { overlay?.setMoves(moves, boardRect) }
-        // wait until our highlight is in the picture, so it isn't mistaken for a change on the board
-        Thread.sleep(350)
+        val g = BoardGeom(m.board.left.toInt(), m.board.top.toInt(), m.board.width().toInt())
+        val ends = HashSet<Int>()
+        val crossed = HashSet<Int>()
+        val pairs = ArrayList<Pair<RectF, RectF>>()
+        for (mv in m.moves) pairs.add(Pair(mv.from, mv.to))
+        for (s in m.line) pairs.add(Pair(s.from, s.to))
+        if (m.threatFrom != null && m.threatTo != null) pairs.add(Pair(m.threatFrom, m.threatTo))
+        for ((a, b) in pairs) {
+            ends.add(screenIndexOf(a.centerX(), a.centerY(), g))
+            ends.add(screenIndexOf(b.centerX(), b.centerY(), g))
+            for (k in 1..15) {
+                val t = k / 16f
+                crossed.add(screenIndexOf(a.centerX() + (b.centerX() - a.centerX()) * t, a.centerY() + (b.centerY() - a.centerY()) * t, g))
+            }
+        }
+        crossed.removeAll(ends)
+        overlaySquares = ends.toIntArray()
+        overlayCrossed = crossed.toIntArray()
+        main.post { overlay?.setModel(m) }
+        // wait until our drawing (and its animation) is on screen, so it isn't mistaken for a change on the board
+        val c = cfg
+        val anim = if (c != null && c.anim) ((OverlayLook.DRAW_MS + OverlayLook.GLOW_MS) / c.animSpeed).toLong() else 0L
+        Thread.sleep(350 + anim)
         look()?.let { prevThumb = thumbOf(it) }
     }
 
-    /** which screen square (row * 8 + column) a highlight rectangle covers */
-    private fun screenIndexOf(r: RectF, g: BoardGeom): Int {
+    /** which screen square (row * 8 + column) a point is on */
+    private fun screenIndexOf(x: Float, y: Float, g: BoardGeom): Int {
         val s = g.size / 8f
-        val col = ((r.centerX() - g.left) / s).toInt().coerceIn(0, 7)
-        val row = ((r.centerY() - g.top) / s).toInt().coerceIn(0, 7)
+        val col = ((x - g.left) / s).toInt().coerceIn(0, 7)
+        val row = ((y - g.top) / s).toInt().coerceIn(0, 7)
         return row * 8 + col
     }
 
@@ -458,8 +615,6 @@ class ChessService : Service() {
             .build()
     }
 
-    private var lastSaid = ""
-
     private fun say(text: String) {
         if (text == lastSaid) return
         lastSaid = text
@@ -477,6 +632,8 @@ class ChessService : Service() {
     override fun onDestroy() {
         running = false
         worker?.interrupt()
+        try { Cfg.prefs(this).unregisterOnSharedPreferenceChangeListener(this) } catch (_: Exception) {}
+        sideBar?.remove()
         try { overlay?.let { wm.removeView(it) } } catch (_: Exception) {}
         try { vdisplay?.release() } catch (_: Exception) {}
         try { projection?.stop() } catch (_: Exception) {}

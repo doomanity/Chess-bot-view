@@ -411,6 +411,22 @@ fun adviceTest(sf: UciEngine) {
     val c3 = adv3.advise(fen, 2, 300)
     check(c3.size == 2 && adv3.listerError == "no route", "fallback when the pc can't be reached")
 
+    // extras: eval bar, threat, main line, max power save
+    val pvLine = UciInfo.parse("info depth 10 multipv 1 score cp 20 pv e2e4 e7e5 g1f3 b8c6")
+    check(pvLine != null && pvLine.pv == listOf("e2e4", "e7e5", "g1f3", "b8c6"), "pv not parsed")
+    val threatened = "r1bqkbnr/pppp1ppp/2n5/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 3 3" // white threatens Qxf7#
+    val full = Advisor(sf, null).full(threatened, 3, 300)
+    println("  threat test: threat=${full.threat?.move} gain=${full.threat?.gain} eval=${full.evalText} bar=${"%.2f".format(full.whiteShare)} line=${full.line} moves=" + full.cands.joinToString { "${it.move} g${it.grade}" })
+    check(full.threat?.move == "h5f7", "the mate threat Qxf7 should be found")
+    check(full.line.isNotEmpty(), "main line preview is empty")
+    check(full.whiteShare in 0f..1f, "eval bar out of range")
+    val quiet = Advisor(sf, null).full(fen, 2, 300)
+    check(quiet.threat == null, "no threat expected after 1.d4 (got ${quiet.threat?.move})")
+    val save = Advisor(sf, null).full(mateFen, 3, 300, maxPower = true)
+    check(save.cands.size == 1 && save.cands[0].star && save.cands[0].move == "h5f7", "max power save should give the mate as one starred move")
+    val inCheck = "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3" // fool's mate: white is mated
+    check(Advisor(sf, null).threatOf(inCheck, 0) == null, "no threat search while in check")
+
     // weak difficulty: its own pick goes first, still graded
     val weak = UciEngine(System.getProperty("sf") ?: "")
     weak.configure(1350)
