@@ -12,13 +12,15 @@ class BoardOverlay(ctx: Context) : View(ctx) {
     private var from: RectF? = null
     private var to: RectF? = null
     private var label = ""
+    private var labelY = 140f
+    private var debug = ""
     private val where = IntArray(2)
 
     private val fromPaint = Paint().apply { color = Color.argb(120, 255, 235, 59) }
     private val toPaint = Paint().apply { color = Color.argb(130, 76, 175, 80) }
     private val line = Paint().apply {
         color = Color.argb(200, 255, 87, 34)
-        strokeWidth = 14f
+        strokeWidth = 10f
         strokeCap = Paint.Cap.ROUND
         isAntiAlias = true
     }
@@ -34,13 +36,35 @@ class BoardOverlay(ctx: Context) : View(ctx) {
         textAlign = Paint.Align.CENTER
         isAntiAlias = true
     }
+    private val debugPaint = Paint().apply {
+        color = Color.argb(200, 255, 255, 255)
+        textSize = 34f
+        textAlign = Paint.Align.CENTER
+        isAntiAlias = true
+        setShadowLayer(4f, 0f, 0f, Color.BLACK)
+    }
 
-    /** rectangles are in screen pixels (the same pixels as the screenshot) */
-    fun showMove(f: RectF?, t: RectF?, text: String) {
+    /** rectangles are in screen pixels (the same pixels as the screenshot). y is where the label sits */
+    fun setMove(f: RectF?, t: RectF?, text: String, y: Float) {
         from = f
         to = t
         label = text
-        visibility = View.VISIBLE
+        labelY = y
+        invalidate()
+    }
+
+    fun clearMove() {
+        if (from == null && to == null && label.isEmpty()) return
+        from = null
+        to = null
+        label = ""
+        invalidate()
+    }
+
+    /** a small status line at the bottom of the screen, so a screenshot tells what the app thinks */
+    fun setDebug(text: String) {
+        if (text == debug) return
+        debug = text
         invalidate()
     }
 
@@ -59,11 +83,15 @@ class BoardOverlay(ctx: Context) : View(ctx) {
             canvas.drawRect(t, outline)
             canvas.drawLine(f.centerX(), f.centerY(), t.centerX(), t.centerY(), line)
         }
+        val screenW = (width + where[0]).toFloat()
         if (label.isNotEmpty()) {
             val w = textPaint.measureText(label) + 80f
-            val cx = width / 2f
-            canvas.drawRoundRect(cx - w / 2, 90f, cx + w / 2, 190f, 40f, 40f, pill)
-            canvas.drawText(label, cx, 160f, textPaint)
+            val cx = screenW / 2f
+            canvas.drawRoundRect(cx - w / 2, labelY - 70f, cx + w / 2, labelY + 30f, 40f, 40f, pill)
+            canvas.drawText(label, cx, labelY, textPaint)
+        }
+        if (debug.isNotEmpty()) {
+            canvas.drawText(debug, screenW / 2f, (height + where[1]) - 120f, debugPaint)
         }
     }
 }

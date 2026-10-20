@@ -25,15 +25,9 @@ BOTTOM says whose pieces start at the bottom of the screen: write white or black
 If you cannot see a full chessboard, write only the word NONE.
 Do not write anything else."""
 
-    /** reads the board part of a screenshot (px = whole screen, w x h) */
-    fun read(apiKey: String, model: String, px: IntArray, w: Int, h: Int, g: BoardGeom): AiRead? {
+    /** reads the board from a picture of it (a bit of margin around the board is fine) */
+    fun read(apiKey: String, model: String, shot: Bitmap): AiRead? {
         lastError = ""
-        val m = (g.size * 0.06f).toInt()
-        val x0 = maxOf(0, g.left - m)
-        val y0 = maxOf(0, g.top - m)
-        val x1 = minOf(w, g.left + g.size + m)
-        val y1 = minOf(h, g.top + g.size + m)
-        val shot = Bitmap.createBitmap(px, y0 * w + x0, w, x1 - x0, y1 - y0, Bitmap.Config.ARGB_8888)
         try {
             val scale = minOf(1f, 1568f / maxOf(shot.width, shot.height))
             val img = if (scale < 1f) {
@@ -52,7 +46,7 @@ Do not write anything else."""
             val textBlock = JSONObject().put("type", "text").put("text", PROMPT)
             val body = JSONObject()
                 .put("model", model)
-                .put("max_tokens", 1000)
+                .put("max_tokens", 4000)
                 .put("messages", JSONArray().put(JSONObject()
                     .put("role", "user")
                     .put("content", JSONArray().put(imageBlock).put(textBlock))))
@@ -81,7 +75,13 @@ Do not write anything else."""
                 val block = content.getJSONObject(i)
                 if (block.optString("type") == "text") sb.append(block.optString("text"))
             }
-            return HaikuParse.parse(sb.toString())
+            val parsed = HaikuParse.parse(sb.toString())
+            if (parsed == null && sb.isBlank()) {
+                // the reply had no text at all: say why (stop reason and kinds of blocks)
+                val kinds = (0 until content.length()).joinToString(",") { content.getJSONObject(it).optString("type") }
+                HaikuParse.lastDebug = "empty reply (stop=${JSONObject(text).optString("stop_reason")}, blocks=$kinds)"
+            }
+            return parsed
         } catch (e: java.io.IOException) {
             lastError = "network error: ${e.message}"
             return null

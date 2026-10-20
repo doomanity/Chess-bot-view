@@ -32,6 +32,11 @@ class MainActivity : Activity() {
     private lateinit var myTurn: CheckBox
     private lateinit var eloBar: SeekBar
     private lateinit var eloLabel: TextView
+    private lateinit var engineStockfish: RadioButton
+    private lateinit var engineMaia: RadioButton
+    private lateinit var maiaHostBox: EditText
+    private lateinit var maiaModelBox: EditText
+    private lateinit var maiaEloBox: EditText
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -112,6 +117,29 @@ class MainActivity : Activity() {
         root.addView(eloBar)
         updateEloLabel()
 
+        addText("engine")
+        val engineGroup = RadioGroup(this)
+        engineGroup.orientation = RadioGroup.HORIZONTAL
+        engineStockfish = RadioButton(this)
+        engineStockfish.text = "stockfish (on the phone)"
+        engineStockfish.id = View.generateViewId()
+        engineMaia = RadioButton(this)
+        engineMaia.text = "maia3 (on my pc)"
+        engineMaia.id = View.generateViewId()
+        engineGroup.addView(engineStockfish)
+        engineGroup.addView(engineMaia)
+        root.addView(engineGroup)
+        if (prefs.getString("engine", "stockfish") == "maia3") engineMaia.isChecked = true else engineStockfish.isChecked = true
+
+        addText("maia3 settings (only used when maia3 is picked). run tools/maia3_server.py on your pc, it prints the address", 12f)
+        addText("pc address")
+        maiaHostBox = addInput(prefs.getString("maia_host", "") ?: "", "192.168.1.20:8765")
+        addText("maia3 model (5m, 23m or 79m)")
+        maiaModelBox = addInput(prefs.getString("maia_model", "23m") ?: "23m", "23m")
+        addText("maia3 rating (the human strength it plays like, 600 to 2600)")
+        maiaEloBox = addInput(prefs.getInt("maia_elo", 1500).toString(), "1500")
+        maiaEloBox.inputType = InputType.TYPE_CLASS_NUMBER
+
         addText("")
         addButton("1. allow draw over other apps") {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
@@ -139,6 +167,10 @@ class MainActivity : Activity() {
             .putString("color", if (black.isChecked) "black" else "white")
             .putBoolean("my_turn", myTurn.isChecked)
             .putInt("elo2", UciEngine.MIN_ELO + eloBar.progress)
+            .putString("engine", if (engineMaia.isChecked) "maia3" else "stockfish")
+            .putString("maia_host", maiaHostBox.text.toString().trim().removePrefix("http://"))
+            .putString("maia_model", maiaModelBox.text.toString().trim().ifEmpty { "23m" })
+            .putInt("maia_elo", (maiaEloBox.text.toString().trim().toIntOrNull() ?: 1500).coerceIn(600, 2600))
             .apply()
     }
 
@@ -146,6 +178,10 @@ class MainActivity : Activity() {
         save()
         if (keyBox.text.isBlank()) {
             toast("paste your api key first")
+            return
+        }
+        if (engineMaia.isChecked && maiaHostBox.text.isBlank()) {
+            toast("type the maia3 pc address first (run tools/maia3_server.py on your pc)")
             return
         }
         if (!Settings.canDrawOverlays(this)) {

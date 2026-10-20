@@ -8,8 +8,11 @@ class BoardGeom(val left: Int, val top: Int, val size: Int) {
     override fun toString() = "board(left=$left, top=$top, size=$size)"
 }
 
-/** what the camera sees on one square: is something on it, and how bright is that something */
-class SquareRead(val occupied: Boolean, val tone: Int, val fill: Float)
+/**
+ * what we see on one square: is a piece on it, how bright is it, and its shape (mask, 24x24 bits: which spots
+ * differ from the empty square). hint dots that apps draw for possible moves are not pieces (dot = true).
+ */
+class SquareRead(val occupied: Boolean, val tone: Int, val fill: Float, val mask: LongArray? = null, val dot: Boolean = false)
 
 /**
  * Finds the chessboard in a screenshot and tells which squares have a piece and what color it is.
@@ -32,7 +35,7 @@ object BoardVision {
 
     /** looks for the board. if hint is still a good board (same place as last time) it is returned as is */
     fun findBoard(px: IntArray, w: Int, h: Int, hint: BoardGeom? = null): BoardGeom? {
-        if (hint != null && scoreGeom(px, w, h, hint) >= 0.85) return hint
+        if (hint != null && scoreGeom(px, w, h, hint) >= 0.7) return hint
 
         // the most common colors on screen: the two square colors are always among them
         val buckets = HashMap<Int, IntArray>()
@@ -70,9 +73,13 @@ object BoardVision {
             for (j in i + 1 until top.size) {
                 if (dist(top[i], top[j]) < 30) continue
                 val g = candidate(px, w, h, top[i], top[j]) ?: continue
-                val s = scoreGeom(px, w, h, g)
-                if (s >= 0.85 && s * g.size > bestScore) {
-                    bestScore = s * g.size
+                val an = analyze(px, w, h, g) ?: continue
+                // the colors the squares really have must be the two colors we looked for,
+                // otherwise this is some other squarish area that happens to look like a board
+                val sameColors = (dist(an.a, top[i]) <= 40 && dist(an.b, top[j]) <= 40) ||
+                    (dist(an.a, top[j]) <= 40 && dist(an.b, top[i]) <= 40)
+                if (an.score >= 0.85 && sameColors && an.score * g.size > bestScore) {
+                    bestScore = an.score * g.size
                     best = g
                 }
             }
@@ -169,9 +176,11 @@ object BoardVision {
         return cols[bestIdx]
     }
 
-    /** 0..1: how much this looks like a real chessboard (squares alternate between two colors) */
-    fun scoreGeom(px: IntArray, w: Int, h: Int, g: BoardGeom): Double {
-        if (g.left < 0 || g.top < 0 || g.left + g.size > w || g.top + g.size > h || g.size < 160) return 0.0
+    private class Analysis(val score: Double, val a: Int, val b: Int)
+
+    /** how much this looks like a real chessboard (squares alternate between two colors), and which two colors */
+    private fun analyze(px: IntArray, w: Int, h: Int, g: BoardGeom): Analysis? {
+        if (g.left < 0 || g.top < 0 || g.left + g.size > w || g.top + g.size > h || g.size < 160) return null
         val cols = IntArray(64)
         for (r in 0..7) for (c in 0..7) cols[r * 8 + c] = edgeColor(px, w, g, r, c)
         // the two most common square colors
@@ -181,7 +190,7 @@ object BoardVision {
             if (e != null) e[1]++ else reps.add(intArrayOf(c, 1))
         }
         reps.sortByDescending { it[1] }
-        if (reps.size < 2 || dist(reps[0][0], reps[1][0]) < 24) return 0.0
+        if (reps.size < 2 || dist(reps[0][0], reps[1][0]) < 24) return null
         val a = reps[0][0]
         val b = reps[1][0]
         val cls = IntArray(64) { i ->
@@ -198,20 +207,68 @@ object BoardVision {
             if (k == (r + c) % 2) m0++
             if (k == (r + c + 1) % 2) m1++
         }
-        return maxOf(m0, m1) / 64.0
+        return Analysis(maxOf(m0, m1) / 64.0, a, b)
     }
 
+    /** 0..1: how much this looks like a real chessboard (squares alternate between two colors) */
+    fun scoreGeom(px: IntArray, w: Int, h: Int, g: BoardGeom): Double = analyze(px, w, h, g)?.score ?: 0.0
+
     // ------------------------------------------------------------------ reading the squares
+
+    private const val N = 24
+    private const val MASK_WORDS = (N * N + 63) / 64
+
+    private class Scan(val diff: Int, val minX: Int, val maxX: Int, val minY: Int, val maxY: Int, val flags: BooleanArray, val luma: IntArray)
+
+    /** how much of the middle of a square differs from the background color bg (the differing pixels go into cols) */
+    private fun scan(px: IntArray, w: Int, x0: Float, y0: Float, s: Float, bg: Int, cols: IntArray): Scan {
+        var diff = 0
+        var minX = N
+        var maxX = -1
+        var minY = N
+        var maxY = -1
+        val flags = BooleanArray(N * N)
+        val lum = IntArray(N * N)
+        for (iy in 0 until N) {
+            for (ix in 0 until N) {
+                val fx = 0.18f + 0.64f * (ix + 0.5f) / N
+                val fy = 0.18f + 0.64f * (iy + 0.5f) / N
+                val p = px[(y0 + fy * s).toInt() * w + (x0 + fx * s).toInt()]
+                lum[iy * N + ix] = luma(p)
+                if (dist(p, bg) > 30) {
+                    flags[iy * N + ix] = true
+                    cols[diff++] = p
+                    if (ix < minX) minX = ix
+                    if (ix > maxX) maxX = ix
+                    if (iy < minY) minY = iy
+                    if (iy > maxY) maxY = iy
+                }
+            }
+        }
+        return Scan(diff, minX, maxX, minY, maxY, flags, lum)
+    }
+
+    private fun median(a: IntArray, n: Int): Int = percentile(a, n, 0.5f)
+
+    private fun percentile(a: IntArray, n: Int, p: Float): Int {
+        val c = a.copyOf(n)
+        java.util.Arrays.sort(c)
+        return c[((n - 1) * p).toInt()]
+    }
 
     /** one SquareRead per square, index = screen row * 8 + screen column (row 0 is the top of the screen) */
     fun readSquares(px: IntArray, w: Int, g: BoardGeom): Array<SquareRead> {
         val s = g.size / 8f
         val out = Array(64) { SquareRead(false, 0, 0f) }
+        val colsA = IntArray(N * N)
+        val colsB = IntArray(N * N)
         for (r in 0..7) for (c in 0..7) {
             val x0 = g.left + c * s
             val y0 = g.top + r * s
 
-            // background of this square: most common color on a ring just inside its border
+            // background of this square: the most common color on a ring just inside its border.
+            // apps sometimes draw a colored frame on a square (like a king in check), so the second most
+            // common ring color is a candidate too, and the one that leaves less "not background" wins
             val ring = ArrayList<Int>(48)
             for (i in 0 until 12) {
                 val t = 0.1f + 0.8f * i / 11f
@@ -230,46 +287,89 @@ object BoardVision {
                     bg = ring[i]
                 }
             }
-
-            // middle of the square: how many pixels are clearly not background, and how big is the blob
-            val n = 24
-            var total = 0
-            var diff = 0
-            var minX = n
-            var maxX = -1
-            var minY = n
-            var maxY = -1
-            val tones = IntArray(n * n)
-            var tn = 0
-            for (iy in 0 until n) {
-                for (ix in 0 until n) {
-                    val fx = 0.18f + 0.64f * (ix + 0.5f) / n
-                    val fy = 0.18f + 0.64f * (iy + 0.5f) / n
-                    val p = px[(y0 + fy * s).toInt() * w + (x0 + fx * s).toInt()]
-                    total++
-                    if (dist(p, bg) > 30) {
-                        diff++
-                        tones[tn++] = luma(p)
-                        if (ix < minX) minX = ix
-                        if (ix > maxX) maxX = ix
-                        if (iy < minY) minY = iy
-                        if (iy > maxY) maxY = iy
+            var sc = scan(px, w, x0, y0, s, bg, colsA)
+            var cols = colsA
+            if (sc.diff > 0.8f * N * N) {
+                var bg2 = 0
+                var votes2 = 0
+                for (i in ring.indices) {
+                    if (dist(ring[i], bg) <= 30) continue
+                    var v = 0
+                    for (j in ring.indices) if (dist(ring[i], ring[j]) <= 30) v++
+                    if (v > votes2) {
+                        votes2 = v
+                        bg2 = ring[i]
+                    }
+                }
+                if (votes2 >= 8) {
+                    val sc2 = scan(px, w, x0, y0, s, bg2, colsB)
+                    if (sc2.diff < sc.diff) {
+                        sc = sc2
+                        cols = colsB
+                        bg = bg2
                     }
                 }
             }
-            val fill = diff.toFloat() / total
-            // a piece is a big blob; the little dots that apps draw for possible moves are not
-            val blobW = if (maxX >= minX) (maxX - minX + 1) * 0.64f / n else 0f
-            val blobH = if (maxY >= minY) (maxY - minY + 1) * 0.64f / n else 0f
-            val occupied = fill >= 0.15f && blobW >= 0.36f && blobH >= 0.36f
 
-            // brightness of the piece: median over the pixels that are not background
-            var tone = 0
-            if (occupied && tn > 0) {
-                java.util.Arrays.sort(tones, 0, tn)
-                tone = tones[tn / 2]
+            val fill = sc.diff.toFloat() / (N * N)
+            // a piece is a big blob; the little dots that apps draw for possible moves are not
+            val blobW = if (sc.maxX >= sc.minX) (sc.maxX - sc.minX + 1) * 0.64f / N else 0f
+            val blobH = if (sc.maxY >= sc.minY) (sc.maxY - sc.minY + 1) * 0.64f / N else 0f
+
+            // a hint dot is one solid color in a round shape. pieces have outlines and details
+            var dot = false
+            if (sc.diff >= 30) {
+                val mr = median(IntArray(sc.diff) { red(cols[it]) }, sc.diff)
+                val mg = median(IntArray(sc.diff) { green(cols[it]) }, sc.diff)
+                val mb = median(IntArray(sc.diff) { blue(cols[it]) }, sc.diff)
+                val mc = rgb(mr, mg, mb)
+                var near = 0
+                for (i in 0 until sc.diff) if (dist(cols[i], mc) <= 36) near++
+                val bw = sc.maxX - sc.minX + 1
+                val bh = sc.maxY - sc.minY + 1
+                val solid = sc.diff.toFloat() / (bw * bh)
+                val round = bw.toFloat() / bh
+                dot = near >= 0.9f * sc.diff && solid >= 0.7f && round in 0.8f..1.25f && blobW <= 0.68f
             }
-            out[r * 8 + c] = SquareRead(occupied, tone, fill)
+            val occupied = !dot && fill >= 0.15f && blobW >= 0.36f && blobH >= 0.36f
+
+            var tone = 0
+            var mask: LongArray? = null
+            if (occupied) {
+                // brightness of the piece: bright or dark body? only the inside of the piece counts (all four
+                // neighbours are piece too), so thin dark outlines and blurry edges can't fool us
+                var bright = 0
+                var darkPx = 0
+                var edgeBright = 0
+                var edgeDark = 0
+                for (iy in 0 until N) for (ix in 0 until N) {
+                    val k = iy * N + ix
+                    if (!sc.flags[k]) continue
+                    val l = sc.luma[k]
+                    val inside = ix > 0 && iy > 0 && ix < N - 1 && iy < N - 1 &&
+                        sc.flags[k - 1] && sc.flags[k + 1] && sc.flags[k - N] && sc.flags[k + N]
+                    if (inside) {
+                        if (l >= 160) bright++ else if (l <= 110) darkPx++
+                    } else {
+                        if (l >= 160) edgeBright++ else if (l <= 110) edgeDark++
+                    }
+                }
+                if (bright + darkPx < 6) { bright += edgeBright; darkPx += edgeDark }
+                tone = if (bright + darkPx == 0) percentile(IntArray(sc.diff) { luma(cols[it]) }, sc.diff, 0.5f)
+                else 70 + 175 * bright / (bright + darkPx)
+                // shape of the piece: which spots of the square differ from the background
+                mask = LongArray(MASK_WORDS)
+                for (iy in 0 until N) for (ix in 0 until N) {
+                    val fx = 0.08f + 0.84f * (ix + 0.5f) / N
+                    val fy = 0.08f + 0.84f * (iy + 0.5f) / N
+                    val p = px[(y0 + fy * s).toInt() * w + (x0 + fx * s).toInt()]
+                    if (dist(p, bg) > 30) {
+                        val bit = iy * N + ix
+                        mask[bit shr 6] = mask[bit shr 6] or (1L shl (bit and 63))
+                    }
+                }
+            }
+            out[r * 8 + c] = SquareRead(occupied, tone, fill, mask, dot)
         }
         return out
     }
@@ -293,7 +393,8 @@ object BoardVision {
             hi = b.average().toFloat()
         }
         if (hi - lo < 50f) return null
-        val mid = (lo + hi) / 2f
+        // a bit closer to the dark group: thin bright pieces look darker than they are, thin dark pieces rarely look bright
+        val mid = lo + 0.4f * (hi - lo)
         return IntArray(64) { i ->
             val r = reads[i]
             if (!r.occupied) EMPTY else if (r.tone > mid) WHITE else BLACK

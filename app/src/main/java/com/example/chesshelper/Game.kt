@@ -106,6 +106,40 @@ object Game {
         return o
     }
 
+    /** index (rank * 8 + file) of the square that is at this place on the screen (row * 8 + column) */
+    fun chessIndex(screenIdx: Int, whiteBottom: Boolean): Int {
+        val r = screenIdx / 8
+        val c = screenIdx % 8
+        val file = if (whiteBottom) c else 7 - c
+        val rank = if (whiteBottom) 7 - r else r
+        return rank * 8 + file
+    }
+
+    /** 1 pawn, 2 knight, 3 bishop, 4 rook, 5 queen, 6 king, 0 nothing */
+    fun typeCode(p: Piece): Int = when (p.pieceType) {
+        PieceType.PAWN -> 1
+        PieceType.KNIGHT -> 2
+        PieceType.BISHOP -> 3
+        PieceType.ROOK -> 4
+        PieceType.QUEEN -> 5
+        PieceType.KING -> 6
+        else -> 0
+    }
+
+    /** piece types of a board, same layout as occOf */
+    fun typesOf(b: Board): IntArray = IntArray(64) { typeCode(b.getPiece(Square.squareAt(it))) }
+
+    /** how many squares have a piece of a different type than the screen shows (squares we can't tell don't count) */
+    fun typeMismatch(b: Board, seen: IntArray): Int {
+        var n = 0
+        for (i in 0 until 64) {
+            if (seen[i] == 0) continue
+            val t = typeCode(b.getPiece(Square.squareAt(i)))
+            if (t != 0 && t != seen[i]) n++
+        }
+        return n
+    }
+
     fun startOcc(): IntArray = occOf(Board())
 
     /** occupancy (screen layout) of 8 rows of text like "rnbqkbnr", top of the screen first */
@@ -135,6 +169,45 @@ object Game {
         }
         if (n > 0) sb.append(n)
         return sb.toString()
+    }
+
+    /** a FEN piece placement from what we see: colors (1 white, 2 black) and piece types, both in the occOf layout */
+    fun placementFromTypes(colors: IntArray, types: IntArray): String {
+        val letters = "?pnbrqk"
+        val sb = StringBuilder()
+        for (rank in 7 downTo 0) {
+            var empty = 0
+            for (file in 0..7) {
+                val i = rank * 8 + file
+                if (colors[i] == BoardVision.EMPTY) {
+                    empty++
+                } else {
+                    if (empty > 0) { sb.append(empty); empty = 0 }
+                    val ch = letters[types[i]]
+                    sb.append(if (colors[i] == BoardVision.WHITE) ch.uppercaseChar() else ch)
+                }
+            }
+            if (empty > 0) sb.append(empty)
+            if (rank > 0) sb.append('/')
+        }
+        return sb.toString()
+    }
+
+    /** whose turn it is, if the position tells: the side that is in check has to move. null if it can't tell */
+    fun turnFromChecks(placement: String): Boolean? {
+        return try {
+            val w = newBoard(placement, true)
+            val bl = newBoard(placement, false)
+            val whiteInCheck = w.isKingAttacked
+            val blackInCheck = bl.isKingAttacked
+            when {
+                whiteInCheck && !blackInCheck -> true
+                blackInCheck && !whiteInCheck -> false
+                else -> null
+            }
+        } catch (e: Exception) {
+            null
+        }
     }
 
     /** piece placement for a FEN from 8 screen rows. a board seen from Black's side is turned around */
@@ -178,8 +251,24 @@ object Game {
     private fun underpromotions(h: Hit): Int =
         h.path.count { it.promotion != Piece.NONE && it.promotion.pieceType != PieceType.QUEEN }
 
-    /** several hits can look the same on screen (a pawn promoting to any piece): take the queen */
-    fun pick(hits: List<Hit>): Hit = hits.minByOrNull { underpromotions(it) }!!
+    /**
+     * several hits can look the same on screen (a pawn promoting to any piece). if we can see the piece types
+     * (typesSeen), the one that fits them best wins, otherwise take the queen
+     */
+    fun pick(hits: List<Hit>, b: Board? = null, typesSeen: IntArray? = null): Hit {
+        if (hits.size == 1) return hits[0]
+        if (b != null && typesSeen != null) {
+            val scored = hits.map { h ->
+                for (m in h.path) b.doMove(m)
+                val mis = typeMismatch(b, typesSeen)
+                for (m in h.path) b.undoMove()
+                Pair(h, mis)
+            }
+            val best = scored.minOf { it.second }
+            return scored.filter { it.second == best }.map { it.first }.minByOrNull { underpromotions(it) }!!
+        }
+        return hits.minByOrNull { underpromotions(it) }!!
+    }
 
     fun play(b: Board, h: Hit) {
         for (m in h.path) b.doMove(m)

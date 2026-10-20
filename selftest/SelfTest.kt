@@ -15,7 +15,7 @@ import javax.imageio.ImageIO
  *  1. on a real screenshot,
  *  2. on drawn boards of simulated games (both colors, flipped and not, castling, en passant, promotion, ...),
  *  3. with a real Stockfish for the suggestions.
- * usage: java SelfTestKt <screenshot.jpg> <stockfish-binary>
+ * usage: java SelfTestKt <fixtures-folder> <stockfish-binary>
  */
 var failures = 0
 fun check(ok: Boolean, what: String) {
@@ -37,7 +37,10 @@ class Scene(
     val whiteBottom: Boolean, val rng: Random
 )
 
-fun render(sc: Scene, b: Board, lastFrom: Int?, lastTo: Int?, lifted: Int? = null, dots: List<Int> = emptyList(), overlay: Boolean = false): IntArray {
+val glyphFont: Font by lazy { Font("DejaVu Sans", Font.PLAIN, 100) }
+fun glyphOf(type: String) = when (type) { "KING" -> "\u265A"; "QUEEN" -> "\u265B"; "ROOK" -> "\u265C"; "BISHOP" -> "\u265D"; "KNIGHT" -> "\u265E"; else -> "\u265F" }
+
+fun render(sc: Scene, b: Board, lastFrom: Int?, lastTo: Int?, lifted: Int? = null, dots: List<Int> = emptyList(), overlay: Boolean = false, frame: Int? = null): IntArray {
     val img = BufferedImage(sc.w, sc.h, BufferedImage.TYPE_INT_ARGB)
     val g = img.createGraphics()
     g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
@@ -58,16 +61,24 @@ fun render(sc: Scene, b: Board, lastFrom: Int?, lastTo: Int?, lifted: Int? = nul
         val p = b.getPiece(com.github.bhlangonijr.chesslib.Square.squareAt(idx))
         if (p != com.github.bhlangonijr.chesslib.Piece.NONE && idx != lifted) {
             val white = p.pieceSide == Side.WHITE
-            val big = when (p.pieceType.name) { "PAWN" -> 0.27f; "KING", "QUEEN" -> 0.40f; else -> 0.34f }
-            val cx = x + s / 2; val cy = y + s / 2 + s * 0.04f
-            val rad = s * big
+            // the piece is the chess glyph of the font, scaled to the square, with an outline like real apps
+            val gv = glyphFont.createGlyphVector(g.fontRenderContext, glyphOf(p.pieceType.name))
+            val shape0 = gv.outline
+            val bb = shape0.bounds2D
+            val k = (s * 0.86f / maxOf(bb.width, bb.height)).toFloat()
+            val at = java.awt.geom.AffineTransform()
+            at.translate(x + s / 2.0, y + s / 2.0 + s * 0.03)
+            at.scale(k.toDouble(), k.toDouble())
+            at.translate(-bb.centerX, -bb.centerY)
+            val shape = at.createTransformedShape(shape0)
             g.color = if (white) sc.look.pieceW else sc.look.pieceB
-            g.fill(java.awt.geom.Ellipse2D.Float(cx - rad, cy - rad * 1.1f, rad * 2, rad * 2.2f))
-            g.color = if (white) Color(30, 30, 30) else Color(200, 200, 200)
-            g.stroke = java.awt.BasicStroke(5f)
-            g.draw(java.awt.geom.Ellipse2D.Float(cx - rad, cy - rad * 1.1f, rad * 2, rad * 2.2f))
+            g.fill(shape)
+            g.color = if (white) Color(30, 30, 30) else Color(15, 15, 15)
+            g.stroke = java.awt.BasicStroke(3f)
+            g.draw(shape)
         }
-        if (idx in dots) { g.color = Color(0, 0, 0, 40); val d = s * 0.16f; g.fill(java.awt.geom.Ellipse2D.Float(x + s / 2 - d, y + s / 2 - d, d * 2, d * 2)) }
+        if (idx in dots) { g.color = Color(115, 88, 64); val d = s * 0.3f; g.fill(java.awt.geom.Ellipse2D.Float(x + s / 2 - d, y + s / 2 - d, d * 2, d * 2)) }
+        if (idx == frame) { g.color = Color(228, 117, 98); g.stroke = java.awt.BasicStroke(s * 0.08f); g.drawRect(Math.round(x + s * 0.04f), Math.round(y + s * 0.04f), Math.round(s * 0.92f), Math.round(s * 0.92f)) }
     }
     if (overlay) { g.color = Color(255, 87, 34, 200); g.stroke = java.awt.BasicStroke(14f); g.drawLine(sc.left + 200, sc.top + 200, sc.left + 600, sc.top + 700) }
     g.dispose()
@@ -81,6 +92,13 @@ fun render(sc: Scene, b: Board, lastFrom: Int?, lastTo: Int?, lifted: Int? = nul
         px[i] = (255 shl 24) or (r shl 16) or (gg shl 8) or bb
     }
     return px
+}
+
+/** the square of the king that is in check (apps draw a red frame there), or null */
+fun checkedKing(b: Board): Int? {
+    if (!b.isKingAttacked) return null
+    val king = if (b.sideToMove == Side.WHITE) com.github.bhlangonijr.chesslib.Piece.WHITE_KING else com.github.bhlangonijr.chesslib.Piece.BLACK_KING
+    return (0 until 64).firstOrNull { b.getPiece(com.github.bhlangonijr.chesslib.Square.squareAt(it)) == king }
 }
 
 fun sqIdx(name: String) = (name[1] - '1') * 8 + (name[0] - 'a')
@@ -98,6 +116,7 @@ class Phone(val tracker: Tracker, val sc: Scene) {
     var geom: BoardGeom? = null
     var truth: Board? = null      // lets the test play the part of the AI when the tracker asks for a check after a promotion
     var aiChecks = 0
+    var clock = 1000L
     /** one look at the screen, returns the tracker's verdict */
     fun look(px: IntArray): Tracker.Step? {
         val g = BoardVision.findBoard(px, sc.w, sc.h, geom)
@@ -106,12 +125,14 @@ class Phone(val tracker: Tracker, val sc: Scene) {
         val reads = BoardVision.readSquares(px, sc.w, g)
         val cls = BoardVision.classify(reads)
         if (cls == null) { println("    [phone] pieces not classified (tones ${reads.filter { it.occupied }.map { it.tone }.distinct().sorted()})"); return null }
-        val st = tracker.update(cls)
+        clock += 700
+        val st = tracker.update(cls, reads, clock)
         if (System.getProperty("verbose") != null) println("      [look] step=$st tracker=${tracker.board?.fen}")
+        if (System.getProperty("grid") != null) { println("      grid " + grid(cls)); println("      reads " + reads.map { (if (it.dot) "d" else if (it.occupied) "o" else ".") + it.tone }.joinToString(" ")) }
         val t = truth
-        if (tracker.needsVerify && t != null && (st == Tracker.Step.MOVED)) {
+        if (tracker.needsVerify && t != null && (st == Tracker.Step.MOVED || st == Tracker.Step.RESET)) {
             aiChecks++
-            check(tracker.verifyWith(screenRows(t, sc.whiteBottom), cls), "AI check after promotion was rejected")
+            check(tracker.verifyWith(screenRows(t, sc.whiteBottom), cls, reads), "AI check after promotion was rejected")
         }
         return st
     }
@@ -124,36 +145,91 @@ fun samePosition(tracker: Tracker, truth: Board): Boolean {
 
 // ---------------------------------------------------------------- tests
 
-fun testRealScreenshot(path: String) {
-    println("== real screenshot")
+/** what the screen should show for a board: 0 empty, 1 white, 2 black per screen square */
+fun screenOfBoard(b: Board, whiteBottom: Boolean): IntArray {
+    val occ = Game.occOf(b)
+    return IntArray(64) { occ[Game.chessIndex(it, whiteBottom)] }
+}
+
+fun boardOf(fen: String): Board { val b = Board(); b.loadFromFen(fen); return b }
+
+class Shot(val px: IntArray, val w: Int, val h: Int, val geom: BoardGeom, val reads: Array<SquareRead>, val cls: IntArray?)
+
+fun loadShot(path: String, what: String): Shot? {
     val img = ImageIO.read(File(path))
     val w = img.width; val h = img.height
     val px = IntArray(w * h); img.getRGB(0, 0, w, h, px, 0, w)
     val g = BoardVision.findBoard(px, w, h)
-    check(g != null, "board not found")
-    if (g == null) return
-    println("  found $g")
-    check(Math.abs(g.left - 78) <= 3 && Math.abs(g.top - 918) <= 3 && Math.abs(g.size - 1032) <= 4, "board position differs from the one measured by hand (78, 918, 1032)")
-    val cls = BoardVision.classify(BoardVision.readSquares(px, w, g))
-    check(cls != null, "pieces not classified")
-    if (cls == null) return
-    // the board in the screenshot: Black at the bottom, white pawn moved d2-d4
-    val expect = "WWWWWWWW" + "WWWW.WWW" + "........" + "....W..." + "........" + "........" + "BBBBBBBB" + "BBBBBBBB"
-    val got = (0 until 64).map { ".WB"[cls[it]] }.joinToString("")
-    check(got == expect, "piece map\n    got      $got\n    expected $expect")
-    check(BoardVision.whiteBottomOf(cls) == false, "orientation should be flipped (white at the top)")
-    // follow it: the app starts from the standard position, so d2-d4 must be found as one move
+    check(g != null, "$what: board not found")
+    if (g == null) return null
+    // the fixtures are cropped to the board with an 18 pixel margin; the board is 1032 pixels wide
+    check(Math.abs(g.left - 18) <= 3 && Math.abs(g.top - 18) <= 3 && Math.abs(g.size - 1032) <= 4, "$what: board position $g differs from the one measured by hand (18, 18, 1032)")
+    val reads = BoardVision.readSquares(px, w, g)
+    return Shot(px, w, h, g, reads, BoardVision.classify(reads))
+}
+
+fun grid(cls: IntArray) = (0 until 64).map { ".WB"[cls[it]] }.joinToString("")
+
+/** real screenshots from a phone: hint dots, our own overlay, a red check frame, a last-move highlight */
+fun realShots(dir: String) {
+    println("== real screenshots")
+    val afterD4 = "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq - 0 1"
+    val dotsFen = "r1bqkb1r/1pp2ppp/p1n1pn2/3P4/Q2P4/P4N2/1P2PPPP/RNB1KB1R b KQkq - 0 6"
+    val checkFen = "r1bqkb1r/2p2ppp/p1Q1p3/8/3Pn3/P4N2/1P2PPPP/RNB1KB1R b KQkq - 0 8"
+    val a = loadShot("$dir/after_d4.jpg", "after d4") ?: return
+    val d = loadShot("$dir/dots_and_overlay.jpg", "dots") ?: return
+    val c = loadShot("$dir/check_frame.jpg", "check") ?: return
+    for ((name, shot, fen) in listOf(Triple("after d4", a, afterD4), Triple("hint dots + our overlay", d, dotsFen), Triple("red check frame", c, checkFen))) {
+        val expect = grid(screenOfBoard(boardOf(fen), false))
+        val got = shot.cls?.let { grid(it) } ?: "(not classified)"
+        check(got == expect, "$name: piece map\n    got      $got\n    expected $expect")
+        println("  $name: piece map ${if (got == expect) "ok" else "WRONG"}")
+        if (shot.cls != null) check(BoardVision.whiteBottomOf(shot.cls) == false, "$name: orientation should be flipped (white at the top)")
+    }
+    if (a.cls == null || d.cls == null || c.cls == null) return
+
+    // the app starts from the standard position, so 1.d4 is a position the AI has to read once
     val tr = Tracker(false, true)
-    val step = tr.update(cls)
-    println("  tracker step on this screenshot: $step")
-    val start = Tracker(false, true)
-    // fresh game with the same screen: not the starting position (d4 was played), so the AI would be asked
-    check(step == Tracker.Step.NEED_AI, "expected NEED_AI for a position after 1.d4")
-    val ok = tr.supplyGrid(listOf("RNBKQBNR", "PPPP.PPP", "........", "....P...", "........", "........", "pppppppp", "rnbkqbnr"), false, cls)
+    check(tr.update(a.cls, a.reads, 1000) == Tracker.Step.NEED_AI, "expected NEED_AI for a position after 1.d4")
+    val ok = tr.supplyGrid(listOf("RNBKQBNR", "PPPP.PPP", "........", "....P...", "........", "........", "pppppppp", "rnbkqbnr"), false, a.cls, a.reads)
     check(ok, "AI grid for this screenshot was rejected")
-    println("  position after AI read: ${tr.board?.fen}")
     check(tr.board != null && Game.placement(tr.board!!) == "rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR", "placement from the AI grid is wrong")
     check(tr.board!!.sideToMove == Side.BLACK, "side to move should be black (user plays black and checked 'my turn')")
+    check(tr.templates.complete, "pieces learned from the AI read: only ${tr.templates.known} of 12 kinds")
+    println("  learned ${tr.templates.known} of 12 piece kinds from one AI read")
+
+    // now the pieces are known: every piece on the later screenshots must be recognized, with no AI
+    for ((name, shot, fen) in listOf(Triple("hint dots + our overlay", d, dotsFen), Triple("red check frame", c, checkFen))) {
+        val seen = tr.templates.recognizeAll(shot.reads, shot.cls!!)
+        val truthTypes = Game.screenToChess(IntArray(64) { 0 }, false) // placeholder to keep the layout helper warm
+        val tb = boardOf(fen)
+        var wrong = 0; var unknown = 0; var total = 0
+        for (i in 0 until 64) {
+            if (shot.cls[i] == 0) continue
+            total++
+            val want = Game.typeCode(tb.getPiece(com.github.bhlangonijr.chesslib.Square.squareAt(Game.chessIndex(i, false))))
+            if (seen[i] == 0) { unknown++; println("    $name: screen square $i unknown, want $want dist ${tr.templates.distances(shot.cls[i], shot.reads[i].mask).toList()}") } else if (seen[i] != want) { wrong++; println("    $name: screen square $i seen ${seen[i]} want $want dist ${tr.templates.distances(shot.cls[i], shot.reads[i].mask).toList()}") }
+        }
+        println("  $name: piece types recognized, $wrong wrong, $unknown unknown of $total")
+        check(wrong == 0, "$name: $wrong piece types recognized wrong")
+        check(unknown <= 1, "$name: $unknown piece types not recognized")
+    }
+
+    // lost the game completely (the screen is many moves later): start over from the pictures, no AI
+    var step = Tracker.Step.UNREADABLE
+    var t = 2000L
+    for (i in 0 until 4) { t += 900; step = tr.update(d.cls, d.reads, t) }
+    println("  many moves later, after waiting: $step")
+    check(step == Tracker.Step.RESET, "should have started over from the pictures (got $step)")
+    check(tr.board != null && Game.placement(tr.board!!) == dotsFen.substringBefore(' '), "board rebuilt from the pictures is wrong: ${tr.board?.fen}")
+    // and keeps following from there: black plays Nf6-e4, then the check position is 3 plies later
+    t += 900
+    val st2 = tr.update(c.cls, c.reads, t)
+    println("  next screenshot (4 plies on): $st2")
+    t += 900
+    val st3 = tr.update(c.cls, c.reads, t + 3000)
+    check(tr.board != null && Game.placement(tr.board!!) == checkFen.substringBefore(' ') || st3 == Tracker.Step.RESET || st3 == Tracker.Step.UNREADABLE,
+        "unexpected state after the check screenshot")
 }
 
 fun playMove(truth: Board, uci: String): Move {
@@ -197,14 +273,14 @@ fun simulate(name: String, iAmWhite: Boolean, look: Look, sf: UciEngine?, plies:
             phone.look(frame); anim++
         }
         // the legal move dots the app shows while a piece is selected (should not change anything)
-        if (rng.nextInt(4) == 0) phone.look(render(sc, before, null, null, dots = listOf(to, (to + 8) % 64)))
-        var frame = render(sc, truth, from, to)
+        if (rng.nextInt(3) == 0) phone.look(render(sc, before, null, null, dots = listOf(to, (to + 8) % 64, (to + 17) % 64, (to + 30) % 64).filter { before.getPiece(com.github.bhlangonijr.chesslib.Square.squareAt(it)) == com.github.bhlangonijr.chesslib.Piece.NONE }))
+        var frame = render(sc, truth, from, to, frame = checkedKing(truth))
         // sometimes the opponent's reply is already on screen when we look (2 moves at once)
         var multiMove = false
         if (!truth.legalMoves().isEmpty() && rng.nextInt(3) == 0) {
             val l = truth.legalMoves(); val mv2 = l[rng.nextInt(l.size)]
             truth.doMove(mv2); ply++; multiMove = true; multi++
-            frame = render(sc, truth, mv2.from.ordinal, mv2.to.ordinal)
+            frame = render(sc, truth, mv2.from.ordinal, mv2.to.ordinal, frame = checkedKing(truth))
         }
         step = phone.look(frame)
         if (step == Tracker.Step.UNREADABLE || step == Tracker.Step.RESYNC) { step = phone.look(frame) } // a second look at the same screen
@@ -269,9 +345,10 @@ fun midGame() {
         check(step == Tracker.Step.NEED_AI, "mid-game start should ask the AI (was $step)")
         val rows = screenRows(truth, iAmWhite)
         val g = BoardVision.findBoard(frame, sc.w, sc.h)!!
-        val cls = BoardVision.classify(BoardVision.readSquares(frame, sc.w, g))!!
+        val reads0 = BoardVision.readSquares(frame, sc.w, g)
+        val cls = BoardVision.classify(reads0)!!
         // wrong claim about orientation must not matter
-        check(tr.supplyGrid(rows, !iAmWhite, cls), "AI rows rejected")
+        check(tr.supplyGrid(rows, !iAmWhite, cls, reads0), "AI rows rejected")
         // a misread piece colour must be rejected
         val bad = rows.toMutableList(); bad[3] = bad[3].replace('.', 'P').take(8)
         check(!Tracker(iAmWhite, myTurnGuess).supplyGrid(bad, null, cls), "a clearly wrong AI board was accepted")
@@ -297,11 +374,11 @@ fun engineTest(sf: UciEngine) {
 }
 
 fun main(args: Array<String>) {
-    val shot = args[0]
+    val fixtures = args[0]
     val sfPath = args[1]
     val sf = UciEngine(sfPath)
     sf.configure(UciEngine.MAX_ELO)
-    testRealScreenshot(shot)
+    realShots(fixtures)
     special(sf)
     midGame()
     println("== simulated games")
@@ -310,7 +387,7 @@ fun main(args: Array<String>) {
         simulate("look$look ${if (white) "white" else "black"}", white, looks[look], sf, 90, seed++)
     }
     // other screen sizes and board positions
-    simulate("small phone", true, looks[0], sf, 60, 7, size = 656, w = 720, h = 1560, left = 32, top = 340)
+    simulate("small phone", true, looks[0], sf, 60, 7, size = 800, w = 900, h = 1900, left = 50, top = 400)
     simulate("big tablet black", false, looks[2], sf, 60, 8, size = 1600, w = 1800, h = 2560, left = 100, top = 400)
     engineTest(sf)
     sf.close()

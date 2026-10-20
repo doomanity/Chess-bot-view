@@ -3,8 +3,14 @@ package com.example.chesshelper
 /** a move for the side to play, and how good stockfish thinks it is for that side (like +0.3) */
 class Suggestion(val move: String, val eval: String)
 
+/** something that can pick a move for a position */
+interface MoveEngine {
+    fun bestMove(fen: String, ms: Int): Suggestion?
+    fun close()
+}
+
 /** talks to the stockfish binary over the UCI text protocol */
-class UciEngine(path: String) {
+class UciEngine(path: String) : MoveEngine {
     private val proc: Process = ProcessBuilder(path).redirectErrorStream(true).start()
     private val writer = proc.outputStream.bufferedWriter()
     private val reader = proc.inputStream.bufferedReader()
@@ -41,7 +47,7 @@ class UciEngine(path: String) {
     }
 
     /** returns the best move like "e2e4" plus a short evaluation, or null if there is no move */
-    fun bestMove(fen: String, ms: Int): Suggestion? {
+    override fun bestMove(fen: String, ms: Int): Suggestion? {
         send("position fen $fen")
         send("go movetime $ms")
         var eval = ""
@@ -65,7 +71,7 @@ class UciEngine(path: String) {
         }
     }
 
-    fun close() {
+    override fun close() {
         try { send("quit") } catch (_: Exception) {}
         proc.destroy()
     }
