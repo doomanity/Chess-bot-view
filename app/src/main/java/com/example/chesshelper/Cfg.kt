@@ -15,7 +15,6 @@ class Cfg(p: SharedPreferences) {
     val maiaModel = (p.getString("maia_model", "23m") ?: "23m").trim().ifEmpty { "23m" }
     val maiaElo = p.getInt("maia_elo", 1500)
     val maiaHuman = p.getInt("maia_human", 0)                   // 0..100: 0 = maia's top pick, 100 = full human randomness
-    val oppElo = p.getInt("opp_elo", 1100)                      // rating of the bot you play against
     val predict = p.getBoolean("predict", true)                 // guess the bot's move while it thinks, get your answer ready
     val showAcc = p.getBoolean("show_acc", true)                // live accuracy for you and the bot
     val nMoves = p.getInt("n_moves", 3).coerceIn(1, 4)

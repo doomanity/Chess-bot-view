@@ -471,9 +471,6 @@ class SideBar(private val ctx: Context, private val wm: WindowManager, private v
             })
         }
 
-        section("the bot i play against")
-        box.addView(slider(400, 3000, 50, cfg.oppElo, { "bot rating: $it" }) { v -> save { it.putInt("opp_elo", v) } })
-
         section("moves shown")
         box.addView(seg((1..4).map { it.toString() to it.toString() }, cfg.nMoves.toString()) { v ->
             save { it.putInt("n_moves", v.toInt()) }

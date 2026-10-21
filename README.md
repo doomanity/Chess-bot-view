@@ -22,7 +22,6 @@ github builds it for you. open the Actions tab and wait for the build (about 5 t
 
 - **guess the bot's move**: while the bot thinks, a faint dashed arrow with a "?" shows its likely move (maia3 at the bot's rating if you use maia3, else stockfish). your answer to that move is worked out early, so if the guess is right your moves show up at once ("ready early" on the card)
 - **live accuracy**: "you 87% · bot 72%" on the card, lichess style. each move is scored by how much it dropped the mover's winning chances. moves the app missed (two moves at once) are skipped
-- **bot rating**: set the rating of the bot you play against. used for the guess and told to maia3 as the opponent rating
 - **pause**: hides everything and stops reading the screen until you resume
 
 ## side bar (quick menu while playing)

@@ -251,7 +251,7 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
         val sf = stockfish ?: return
         if (sf.elo != c.elo) sf.configure(c.elo)
         remote?.close()
-        remote = if (c.useMaia && c.maiaHost.isNotEmpty()) RemoteEngine(c.maiaHost, c.maiaModel, c.maiaElo, c.oppElo, c.maiaTemp) else null
+        remote = if (c.useMaia && c.maiaHost.isNotEmpty()) RemoteEngine(c.maiaHost, c.maiaModel, c.maiaElo, 0, c.maiaTemp) else null
         engineName = if (remote != null) "maia3 ${c.maiaElo}" + (if (c.maiaHuman > 0) " · human ${c.maiaHuman}%" else "")
             else if (c.elo < UciEngine.MAX_ELO) "stockfish ${c.elo}" else "stockfish"
         ready.clear()
@@ -625,7 +625,7 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
         val r = remote
         if (r != null) {
             try {
-                guess = r.opponentMove(fen, c.oppElo)
+                guess = r.opponentMove(fen, c.maiaElo)
             } catch (e: java.io.IOException) {
                 // pc not reachable: stockfish's guess below
             }

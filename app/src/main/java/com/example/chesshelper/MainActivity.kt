@@ -88,7 +88,6 @@ class MainActivity : Activity() {
         label(card, "i play")
         card.addView(seg(listOf("white" to "white", "black" to "black"), if (c.iAmWhite) "white" else "black") { v -> save { it.putString("color", v) } })
         card.addView(chip("it's my turn when i press start", c.myTurnAtStart) { on -> save { it.putBoolean("my_turn", on) } }, full(top = 10f))
-        card.addView(slider(400, 3000, 50, c.oppElo, { "the bot i play against is rated: $it" }) { v -> save { it.putInt("opp_elo", v) } })
 
         // ---- engine
         card = newCard("engine")
