@@ -85,6 +85,22 @@ object Game {
         }
     }
 
+    /** the position after a move like "e2e4" (fen), or null if it isn't a legal move there */
+    fun after(fen: String, uci: String): String? {
+        return try {
+            val b = Board()
+            b.loadFromFen(fen)
+            val mv = b.legalMoves().firstOrNull { it.toString() == uci } ?: return null
+            b.doMove(mv)
+            b.fen
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** the part of a fen that says what the position is (pieces, side to move, castling, en passant) */
+    fun posKey(fen: String): String = fen.split(" ").take(4).joinToString(" ")
+
     fun placement(b: Board): String = b.fen.substringBefore(' ')
 
     // ------------------------------------------------------------------ occupancy (which squares have a white / black piece)

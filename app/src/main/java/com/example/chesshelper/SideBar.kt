@@ -28,6 +28,8 @@ interface SideBarHost {
     fun onMaxPower()
     fun onNewGame()
     fun onStopHelper()
+    fun onPauseToggle()
+    fun isPaused(): Boolean
     fun onPanelOpen(open: Boolean)
     fun status(): String
     fun savesLeft(): Int // -1 = unlimited
@@ -196,7 +198,7 @@ class SideBar(private val ctx: Context, private val wm: WindowManager, private v
             f.textSize = r * 1.15f
             f.textAlign = Paint.Align.CENTER
             f.setShadowLayer(r * 0.35f, 0f, 0f, Theme.withAlpha(accent, (255 * vis).toInt()))
-            canvas.drawText("\u265E", cx, cy + r * 0.4f, f)
+            canvas.drawText(if (host.isPaused()) "\u275A\u275A" else "\u265E", cx, cy + r * 0.4f, f)
             f.clearShadowLayer()
         }
 
@@ -439,6 +441,12 @@ class SideBar(private val ctx: Context, private val wm: WindowManager, private v
         }, weight())
         row.addView(bigButton("⟲", "new game", Color.rgb(160, 170, 190)) { host.onNewGame(); closePanel() }, weight())
         box.addView(row)
+        val paused = host.isPaused()
+        box.addView(bigButton(if (paused) "▶" else "❚❚", if (paused) "resume" else "pause", if (paused) Color.rgb(0, 200, 83) else Color.rgb(255, 196, 0)) {
+            host.onPauseToggle(); closePanel()
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            setMargins(dp(3f), dp(3f), dp(3f), dp(3f))
+        })
 
         section("i play")
         box.addView(seg(listOf("white" to "white", "black" to "black"), if (cfg.iAmWhite) "white" else "black") { v ->
@@ -452,6 +460,9 @@ class SideBar(private val ctx: Context, private val wm: WindowManager, private v
         })
         if (cfg.useMaia) {
             box.addView(slider(600, 2600, 100, cfg.maiaElo, { "maia3 plays like: $it" }) { v -> save { it.putInt("maia_elo", v) } })
+            box.addView(slider(0, 100, 5, cfg.maiaHuman, { if (it == 0) "human-ness: 0% (always maia's top pick)" else "human-ness: $it%" }) { v ->
+                save { it.putInt("maia_human", v) }
+            })
             if (cfg.maiaHost.isEmpty()) note("set the pc address in the app first")
         } else {
             box.addView(slider(UciEngine.MIN_ELO, UciEngine.MAX_ELO, 10, cfg.elo,
@@ -459,6 +470,9 @@ class SideBar(private val ctx: Context, private val wm: WindowManager, private v
                 save { it.putInt("elo2", v) }
             })
         }
+
+        section("the bot i play against")
+        box.addView(slider(400, 3000, 50, cfg.oppElo, { "bot rating: $it" }) { v -> save { it.putInt("opp_elo", v) } })
 
         section("moves shown")
         box.addView(seg((1..4).map { it.toString() to it.toString() }, cfg.nMoves.toString()) { v ->
@@ -472,6 +486,11 @@ class SideBar(private val ctx: Context, private val wm: WindowManager, private v
         chips.addView(chip("threat", cfg.showThreat) { on -> save { it.putBoolean("show_threat", on) } }, weight())
         chips.addView(chip("best line", cfg.showLine) { on -> save { it.putBoolean("show_line", on) } }, weight())
         box.addView(chips)
+        val chips2 = LinearLayout(ctx)
+        chips2.orientation = LinearLayout.HORIZONTAL
+        chips2.addView(chip("guess bot move", cfg.predict) { on -> save { it.putBoolean("predict", on) } }, weight())
+        chips2.addView(chip("accuracy", cfg.showAcc) { on -> save { it.putBoolean("show_acc", on) } }, weight())
+        box.addView(chips2)
 
         section("arrow style")
         box.addView(seg(listOf("neon" to "neon", "solid" to "solid", "minimal" to "minimal"), cfg.style) { v ->

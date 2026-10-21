@@ -436,6 +436,42 @@ fun adviceTest(sf: UciEngine) {
     weak.close()
 }
 
+fun accuracyTest(sf: UciEngine) {
+    println("== accuracy and guessing")
+    // a move that keeps the score is ~100%, a blunder is low
+    check(Accuracy.moveAccuracy(true, 30, 25) > 97, "a quiet good move scores high")
+    check(Accuracy.moveAccuracy(true, 30, -600) < 20, "dropping a piece scores low")
+    check(Accuracy.moveAccuracy(false, -30, -25) > 97, "black's good move scores high (white's side numbers)")
+    check(Accuracy.moveAccuracy(false, -30, 700) < 20, "black's blunder scores low")
+    check(Accuracy.moveAccuracy(true, 30, 300) == 100.0, "a move better than expected is capped at 100")
+    val a = Accuracy()
+    check(a.text() == null, "no accuracy before any move")
+    repeat(10) { a.add(true, true, 20, 15) }
+    a.add(false, false, 20, 25)
+    val good = a.myScore!!
+    a.add(true, true, 20, -800)
+    val after = a.myScore!!
+    println("  ten good moves: $good%, plus one blunder: $after%, text: ${a.text()}")
+    check(good >= 95, "ten good moves give a high score")
+    check(after < good - 10, "a blunder pulls the score down a lot")
+    check(a.text()!!.startsWith("you ") && " · bot " in a.text()!!, "text format")
+    a.reset()
+    check(a.myScore == null && a.botScore == null, "reset clears it")
+
+    // the position after a guessed move, and position keys that ignore the move counters
+    val start = Board().fen
+    val e4 = Game.after(start, "e2e4")
+    check(e4 != null && Game.posKey(e4).startsWith("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b"), "after e2e4: $e4")
+    check(Game.after(start, "e2e5") == null, "illegal move gives null")
+    val tb = Board()
+    tb.doMove(com.github.bhlangonijr.chesslib.move.Move("e2e4", Side.WHITE))
+    check(Game.posKey(tb.fen) == Game.posKey(e4!!), "the tracker's board and the guessed board give the same key")
+    // a guessed reply is worked out for the position after the guess
+    val adv = Advisor(sf, null)
+    val ready = adv.full(e4, 3, 300, threat = false)
+    check(ready.cands.isNotEmpty(), "answer ready for the guessed position")
+}
+
 fun main(args: Array<String>) {
     val fixtures = args[0]
     val sfPath = args[1]
@@ -454,6 +490,7 @@ fun main(args: Array<String>) {
     simulate("big tablet black", false, looks[2], sf, 60, 8, size = 1600, w = 1800, h = 2560, left = 100, top = 400)
     engineTest(sf)
     adviceTest(sf)
+    accuracyTest(sf)
     sf.close()
     println(if (failures == 0) "\nALL TESTS PASSED" else "\n$failures FAILURE(S)")
     if (failures > 0) System.exit(1)

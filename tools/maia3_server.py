@@ -84,13 +84,15 @@ class Uci:
 
 
 class Pool:
-    """keeps one engine for the current model and rating, restarts it when the app asks for another"""
+    """keeps one engine per model. rating, opponent rating and temperature are changed per request (uci options),
+    so asking for the bot's likely move and then for yours doesn't reload the model"""
 
     def __init__(self, args):
         self.args = args
         self.lock = threading.Lock()
         self.key = None
         self.engine = None
+        self.opts = {}
 
     def command(self, model, elo):
         if self.args.cmd:
@@ -100,22 +102,32 @@ class Pool:
             cmd.append("--no-use-amp")
         return cmd
 
-    def move(self, fen, model, elo, n=1):
+    def set(self, name, value):
+        value = str(value)
+        if self.opts.get(name) != value:
+            self.engine.option(name, value)
+            self.opts[name] = value
+            return True
+        return False
+
+    def move(self, fen, model, elo, n=1, oppo=None, temperature=None):
         with self.lock:
-            key = (model, elo)
-            if key != self.key:
+            if model != self.key:
                 if self.engine:
                     self.engine.close()
-                print(f"starting engine: model {model}, rating {elo} (the first start loads the model, be patient)")
+                print(f"starting engine: model {model} (the first start loads the model, be patient)")
                 self.engine = Uci(self.command(model, elo))
-                # maia3 normally picks a human-like move at random (a human blunders now and then).
-                # temperature 0 makes it always play its most likely move, which is far stronger
-                self.engine.option("Temperature", self.args.temperature)
-                self.engine.option("SelfElo", elo)
-                self.engine.option("OppoElo", self.args.oppo_elo or elo)
+                self.opts = {}
+                self.key = model
+            # temperature 0 = always maia's most likely move (strongest). around 1 = it picks like a real human,
+            # with a human's randomness (now and then a mistake)
+            temp = self.args.temperature if temperature is None else temperature
+            changed = self.set("Temperature", temp)
+            changed |= self.set("SelfElo", elo)
+            changed |= self.set("OppoElo", oppo or self.args.oppo_elo or elo)
+            if changed:
                 self.engine.send("isready")
                 self.engine.wait("readyok")
-                self.key = key
             try:
                 return self.engine.best(fen, n)
             except Exception:
@@ -155,8 +167,12 @@ def make_handler(pool, default_model, default_elo):
                 model = str(req.get("model") or default_model)
                 elo = int(req.get("elo") or default_elo)
                 n = max(1, min(8, int(req.get("n") or 1)))
-                mv, moves = pool.move(fen, model, elo, n)
-                print(f"{fen}  ->  {' '.join(moves)}")
+                oppo = int(req.get("oppo_elo") or 0) or None
+                temp = req.get("temperature")
+                temp = None if temp is None else round(max(0.0, min(2.0, float(temp))), 2)
+                mv, moves = pool.move(fen, model, elo, n, oppo, temp)
+                who = req.get("for") or "you"
+                print(f"[{who} {elo}] {fen}  ->  {' '.join(moves)}")
                 self.reply(200, {"move": mv, "moves": moves})
             except Exception as e:
                 print("error:", e)
@@ -181,6 +197,7 @@ def main():
     pool = Pool(args)
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(pool, args.model, args.elo))
     print(f"maia3 server ready. in the app type this address:  {local_ip()}:{args.port}")
+    print(f"away from home with tailscale? use your pc's 100.x.x.x tailscale address instead, with :{args.port}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

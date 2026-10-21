@@ -34,7 +34,11 @@ class OverlayModel(
     val threatFrom: RectF? = null,
     val threatTo: RectF? = null,
     val line: List<LineStep> = emptyList(),
-    val title: String = ""
+    val title: String = "",
+    val accuracy: String? = null,     // like "you 87% · bot 72%"
+    val predFrom: RectF? = null,      // the bot's likely next move (shown while it thinks)
+    val predTo: RectF? = null,
+    val predLabel: String = ""        // like "Nf6"
 )
 
 /** how to draw: style, colors, animation, sizes */
@@ -53,6 +57,10 @@ class OverlayLook(
 
 /** transparent full-screen layer that draws the suggested moves on top of the chess app */
 class BoardOverlay(ctx: Context) : View(ctx) {
+    companion object {
+        val PREDICT = Color.rgb(200, 206, 222) // the bot's guessed move: soft grey-white
+    }
+
     private var model: OverlayModel? = null
     private var look = OverlayLook("neon", Color.rgb(0, 229, 255), true, 1f, 1f, 1f, 0.95f)
     private var start = 0L
@@ -144,9 +152,10 @@ class BoardOverlay(ctx: Context) : View(ctx) {
             if (m.evalShare != null) drawEvalBar(canvas, m, screenW)
             for (s in m.line) drawLineStep(canvas, s)
             if (m.threatFrom != null && m.threatTo != null) drawThreat(canvas, m.threatFrom, m.threatTo)
+            if (m.predFrom != null && m.predTo != null) drawPrediction(canvas, m.predFrom, m.predTo)
             // the worst first, so the best move is drawn on top
             for (mv in m.moves.sortedByDescending { it.rank }) drawMove(canvas, mv)
-            if (m.moves.isNotEmpty()) drawCard(canvas, m, screenW)
+            if (m.moves.isNotEmpty() || m.predLabel.isNotEmpty()) drawCard(canvas, m, screenW)
         }
         if (debug.isNotEmpty()) canvas.drawText(debug, screenW / 2f, (height + where[1]) - 36f * d, debugPaint)
     }
@@ -317,6 +326,26 @@ class BoardOverlay(ctx: Context) : View(ctx) {
         }
     }
 
+    /** the bot's likely next move: a faint dashed arrow with a "?" */
+    private fun drawPrediction(c: Canvas, from: RectF, to: RectF) {
+        val sq = to.width()
+        val col = PREDICT
+        arrow(c, from, to, col, sq * 0.07f * look.arrowSize, 0.6f, true)
+        val r = sq * 0.13f * drawP
+        if (r > 1f) {
+            val bx = to.right - sq * 0.18f
+            val by = to.top + sq * 0.18f
+            badge(c, bx, by, r, col)
+            text.textSize = r * 1.35f
+            text.textAlign = Paint.Align.CENTER
+            text.isFakeBoldText = true
+            text.color = Color.rgb(20, 24, 36)
+            c.drawText("?", bx, by + r * 0.48f, text)
+            text.color = Color.WHITE
+            text.isFakeBoldText = false
+        }
+    }
+
     private fun badge(c: Canvas, cx: Float, cy: Float, r: Float, col: Int) {
         if (neon) {
             fill.color = Theme.withAlpha(col, (60 * glow).toInt())
@@ -421,10 +450,12 @@ class BoardOverlay(ctx: Context) : View(ctx) {
         val k = look.cardSize
         val rowH = 34f * d * k
         val pad = 10f * d * k
-        val head = if (m.title.isNotEmpty()) 22f * d * k else 0f
+        val head = if (m.title.isNotEmpty() || m.accuracy != null) 22f * d * k else 0f
         val board = m.board
         val w = minOf(board.width(), screenW - 24f * d).coerceAtLeast(220f * d)
-        val h = m.moves.size * rowH + pad * 2 + head
+        val predRow = m.moves.isEmpty() && m.predLabel.isNotEmpty()
+        val rows = if (predRow) 1 else m.moves.size
+        val h = rows * rowH + pad * 2 + head
         val left = (board.left + (board.width() - w) / 2f).coerceIn(8f * d, maxOf(8f * d, screenW - w - 8f * d))
         val evalAbove = m.evalShare != null && board.left < 9f * d * k + 8f * d
         var top = board.top - h - (if (evalAbove) 30f else 14f) * d
@@ -452,8 +483,29 @@ class BoardOverlay(ctx: Context) : View(ctx) {
             text.letterSpacing = 0.12f
             c.drawText(m.title.uppercase(), rect.left + pad + 4f * d, y0 + head * 0.62f, text)
             text.letterSpacing = 0f
+            m.accuracy?.let {
+                text.textAlign = Paint.Align.RIGHT
+                text.color = Color.argb(225, 225, 232, 245)
+                c.drawText("acc  $it", rect.right - pad - 4f * d, y0 + head * 0.62f, text)
+            }
             text.color = Color.WHITE
             y0 += head
+        }
+        if (predRow) {
+            val cy = y0 + rowH / 2f
+            val dotX = rect.left + pad + rowH * 0.36f
+            fill.color = PREDICT
+            c.drawCircle(dotX, cy, rowH * 0.3f, fill)
+            text.textSize = rowH * 0.42f
+            text.textAlign = Paint.Align.CENTER
+            text.isFakeBoldText = true
+            text.color = Color.rgb(20, 24, 36)
+            c.drawText("?", dotX, cy + rowH * 0.15f, text)
+            text.isFakeBoldText = false
+            text.color = Color.WHITE
+            text.textSize = rowH * 0.46f
+            text.textAlign = Paint.Align.LEFT
+            c.drawText("bot will likely play ${m.predLabel}", rect.left + pad + rowH * 0.95f, cy + rowH * 0.17f, text)
         }
         for ((i, mv) in m.moves.sortedBy { it.rank }.withIndex()) {
             val cy = y0 + rowH * i + rowH / 2f

@@ -63,6 +63,7 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
     @Volatile private var panelOpen = false
     @Volatile private var savesLeft = 3
     @Volatile private var lastSaid = ""
+    @Volatile private var paused = false
 
     // what we know about the screen
     private var geom: BoardGeom? = null           // the board, in screen pixels
@@ -74,10 +75,23 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
     private var overlayCrossed = IntArray(0)      // squares our arrows only pass over
     private var shownFen: String? = null
     private var shownModel: OverlayModel? = null
+    @Volatile private var lastModel: OverlayModel? = null // what is on the screen now (our move or the bot's guess)
     private var aiCalls = 0
     private var aiBlockedUntil = 0L
     private var engineName = "stockfish"
     private var tracker: Tracker? = null
+
+    // live accuracy: the engine score of every position we saw (white's side), and the move waiting for its score
+    private val accuracy = Accuracy()
+    @Volatile private var accLine: String? = null
+    private val evals = HashMap<String, Int>()
+    private var lastPosKey: String? = null
+    private var pendingAcc: Triple<String, String, Boolean>? = null // position before, position after, mover is white
+
+    // the bot's guessed move, and our answer worked out early for the position it leads to
+    private val ready = HashMap<String, Advice>()
+    private var predShownKey: String? = null
+    private var predModel: OverlayModel? = null
 
     private enum class Mode { NORMAL, RETHINK, SAVE }
 
@@ -86,6 +100,10 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "STOP") {
             stopSelf()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == "PAUSE") {
+            if (running) onPauseToggle()
             return START_NOT_STICKY
         }
         if (running) return START_NOT_STICKY
@@ -169,7 +187,7 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
         cfg = c
         if (key != null && key in Cfg.LOOK_KEYS) {
             overlay?.setLook(lookOf(c))
-            shownModel?.let { if (overlayShown) overlay?.setModel(it) }
+            lastModel?.let { if (overlayShown) overlay?.setModel(it) }
             if (key == "sidebar" || key == "theme" || key == "handle_side" || key == "handle_mode" ||
                 key == "handle_size" || key == "handle_idle") {
                 val sb = sideBar
@@ -195,6 +213,20 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
 
     override fun onStopHelper() { main.post { stopSelf() } }
 
+    override fun onPauseToggle() {
+        paused = !paused
+        if (!paused) {
+            prevThumb = null
+            wantRead = true
+        }
+        val text = if (paused) "paused · tap resume to go on" else "resumed"
+        lastSaid = ""
+        say(text)
+        main.post { sideBar?.refresh() }
+    }
+
+    override fun isPaused(): Boolean = paused
+
     override fun onPanelOpen(open: Boolean) {
         panelOpen = open
         if (!open) {
@@ -203,7 +235,10 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
         }
     }
 
-    override fun status(): String = "$engineName · ${lastSaid.ifEmpty { "starting" }}"
+    override fun status(): String {
+        val acc = if (cfg?.showAcc != false) accLine?.let { "\naccuracy: $it" } ?: "" else ""
+        return "$engineName · ${lastSaid.ifEmpty { "starting" }}$acc"
+    }
 
     override fun savesLeft(): Int = savesLeft
 
@@ -216,8 +251,11 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
         val sf = stockfish ?: return
         if (sf.elo != c.elo) sf.configure(c.elo)
         remote?.close()
-        remote = if (c.useMaia && c.maiaHost.isNotEmpty()) RemoteEngine(c.maiaHost, c.maiaModel, c.maiaElo) else null
-        engineName = if (remote != null) "maia3 ${c.maiaElo}" else if (c.elo < UciEngine.MAX_ELO) "stockfish ${c.elo}" else "stockfish"
+        remote = if (c.useMaia && c.maiaHost.isNotEmpty()) RemoteEngine(c.maiaHost, c.maiaModel, c.maiaElo, c.oppElo, c.maiaTemp) else null
+        engineName = if (remote != null) "maia3 ${c.maiaElo}" + (if (c.maiaHuman > 0) " · human ${c.maiaHuman}%" else "")
+            else if (c.elo < UciEngine.MAX_ELO) "stockfish ${c.elo}" else "stockfish"
+        ready.clear()
+        predShownKey = null
         advisor = Advisor(sf, remote)
         tracker?.iAmWhite = c.iAmWhite
         shownFen = null
@@ -316,11 +354,19 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
                         Thread.sleep(200)
                         continue
                     }
+                    if (paused) {
+                        hideMove()
+                        main.post { overlay?.setDebug("paused") }
+                        prevThumb = null
+                        Thread.sleep(300)
+                        continue
+                    }
                     if (wantNewGame) {
                         wantNewGame = false
                         tr.forget()
                         savesLeft = cfg?.savesPerGame ?: 3
                         shownFen = null
+                        resetGameStats()
                         hideMove()
                         wantRead = true
                         say("new game: reading the board again")
@@ -471,35 +517,51 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
         debugLine(tracker, step)
         val b = tracker.board ?: return step
         val wb = tracker.whiteBottom ?: c.iAmWhite
+        val fen = b.fen
+        val key = Game.posKey(fen)
+        if (step == Tracker.Step.STARTED) resetGameStats()
+        if (key != lastPosKey) {
+            // a new position: if exactly one move was played, its accuracy is known once this position has a score
+            val before = lastPosKey
+            pendingAcc = if (before != null && step == Tracker.Step.MOVED && tracker.lastPlies == 1)
+                Triple(before, key, b.sideToMove == Side.BLACK) else null
+            lastPosKey = key
+        }
+        val g = f.abs
         val myTurn = (b.sideToMove == Side.WHITE) == c.iAmWhite
         if (!myTurn) {
-            say("waiting for the opponent...")
             if (mode != Mode.NORMAL) toast("it's the opponent's turn")
             shownFen = null
+            botTurn(fen, key, g, wb, c, mode)
             return step
         }
 
-        val fen = b.fen
-        val g = f.abs
         val cached = shownModel
         if (mode == Mode.NORMAL && shownFen == fen && cached != null) {
             showModel(cached)
             return step
         }
         val adv = advisor ?: return step
-        say(when (mode) {
-            Mode.SAVE -> "max power: thinking hard..."
-            Mode.RETHINK -> "thinking again..."
-            else -> "thinking..."
-        })
-        val ms = if (mode == Mode.RETHINK) (c.thinkMs * 2.5f).toInt() else c.thinkMs
-        val advice = adv.full(fen, c.nMoves, ms, threat = c.showThreat, maxPower = mode == Mode.SAVE)
-        adv.listerError?.let { toast("maia3 pc not reachable ($it), using stockfish") }
+        // the bot played the move we guessed: the answer is already worked out
+        val early = if (mode == Mode.NORMAL) ready[key] else null
+        val advice = if (early != null) early else {
+            say(when (mode) {
+                Mode.SAVE -> "max power: thinking hard..."
+                Mode.RETHINK -> "thinking again..."
+                else -> "thinking..."
+            })
+            val ms = if (mode == Mode.RETHINK) (c.thinkMs * 2.5f).toInt() else c.thinkMs
+            val a = adv.full(fen, c.nMoves, ms, threat = c.showThreat, maxPower = mode == Mode.SAVE)
+            adv.listerError?.let { toast("maia3 pc not reachable ($it), using stockfish") }
+            a
+        }
+        ready.clear()
         if (advice.cands.isEmpty()) {
             say("no move found, game over?")
             return step
         }
         if (mode == Mode.SAVE && savesLeft > 0) savesLeft--
+        noteEval(key, advice.evalWhite)
 
         fun rect(sq: String) = squareRect(g, wb, sq)
         val moves = ArrayList<DrawMove>()
@@ -517,19 +579,20 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
             }
         }
         val th = advice.threat
-        val boardRect = RectF(g.left.toFloat(), g.top.toFloat(), (g.left + g.size).toFloat(), (g.top + g.size).toFloat())
         val title = when {
             mode == Mode.SAVE -> "max power" + (if (savesLeft >= 0) " · $savesLeft left" else "")
+            early != null -> "$engineName · ready early"
             else -> engineName
         }
         val model = OverlayModel(
-            moves, boardRect, wb,
+            moves, boardRectOf(g), wb,
             evalShare = if (c.showEval) advice.whiteShare else null,
             evalText = if (c.showEval) advice.evalText else null,
             threatFrom = th?.let { rect(it.move.substring(0, 2)) },
             threatTo = th?.let { rect(it.move.substring(2, 4)) },
             line = line,
-            title = title
+            title = title,
+            accuracy = accText(c)
         )
         say("best: " + advice.cands.joinToString("  ") { "${Game.san(fen, it.move)} ${it.text}" })
         shownFen = fen
@@ -537,6 +600,97 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
         showModel(model)
         return step
     }
+
+    /**
+     * the bot's turn: score the position (for accuracy), guess the bot's move and show it,
+     * then work out our answer to that move early so it shows up at once if the guess was right
+     */
+    private fun botTurn(fen: String, key: String, g: BoardGeom, wb: Boolean, c: Cfg, mode: Mode) {
+        val cachedPred = predModel
+        if (mode == Mode.NORMAL && predShownKey == key && cachedPred != null) {
+            showModel(cachedPred)
+            return
+        }
+        say("waiting for the opponent...")
+        if (!c.predict && !c.showAcc) return
+        val sf = stockfish ?: return
+        val top = sf.analyse(fen, 250, 1).firstOrNull() ?: return
+        val whiteToMove = fen.split(" ").getOrNull(1) != "b"
+        val evalWhite = if (whiteToMove) top.score else -top.score
+        noteEval(key, evalWhite)
+        if (!c.predict) return
+
+        // maia3 playing as the bot is the best guess of what a bot of that rating does, else stockfish's top move
+        var guess: String? = null
+        val r = remote
+        if (r != null) {
+            try {
+                guess = r.opponentMove(fen, c.oppElo)
+            } catch (e: java.io.IOException) {
+                // pc not reachable: stockfish's guess below
+            }
+        }
+        val move = guess?.takeIf { Game.after(fen, it) != null } ?: top.move
+        val after = Game.after(fen, move) ?: return
+        val fr = squareRect(g, wb, move.substring(0, 2)) ?: return
+        val to = squareRect(g, wb, move.substring(2, 4)) ?: return
+        val evalInfo = Advice(emptyList(), evalWhite, top.mate?.let { if (whiteToMove) it else -it }, null, emptyList())
+        val san = Game.san(fen, move)
+        val model = OverlayModel(
+            emptyList(), boardRectOf(g), wb,
+            evalShare = if (c.showEval) evalInfo.whiteShare else null,
+            evalText = if (c.showEval) evalInfo.evalText else null,
+            title = "bot's turn",
+            accuracy = accText(c),
+            predFrom = fr, predTo = to, predLabel = san
+        )
+        predShownKey = key
+        predModel = model
+        showModel(model)
+
+        // get our answer ready, unless the bot already moved while we were guessing
+        val afterKey = Game.posKey(after)
+        if (ready.containsKey(afterKey)) return
+        val now = look() ?: return
+        val p = prevThumb
+        if (p != null && BoardVision.changed(p, thumbOf(now))) return
+        val adv = advisor ?: return
+        say("bot will likely play $san · getting your answer ready")
+        val a = adv.full(after, c.nMoves, c.thinkMs, threat = c.showThreat)
+        if (adv.listerError == null && a.cands.isNotEmpty()) {
+            ready.clear()
+            ready[afterKey] = a
+        }
+        say("your answer is ready if the bot plays $san")
+    }
+
+    /** remembers the score of a position, and finishes the accuracy of the move that led to it */
+    private fun noteEval(key: String, evalWhite: Int) {
+        if (evals.size > 500) evals.clear()
+        evals[key] = evalWhite
+        val p = pendingAcc ?: return
+        if (p.second != key) return
+        pendingAcc = null
+        val before = evals[p.first] ?: return
+        val moverWhite = p.third
+        accuracy.add(moverWhite == (cfg?.iAmWhite ?: true), moverWhite, before, evalWhite)
+        accLine = accuracy.text()
+    }
+
+    private fun accText(c: Cfg): String? = if (c.showAcc) accLine else null
+
+    private fun resetGameStats() {
+        accuracy.reset()
+        accLine = null
+        evals.clear()
+        lastPosKey = null
+        pendingAcc = null
+        ready.clear()
+        predShownKey = null
+        predModel = null
+    }
+
+    private fun boardRectOf(g: BoardGeom) = RectF(g.left.toFloat(), g.top.toFloat(), (g.left + g.size).toFloat(), (g.top + g.size).toFloat())
 
     private fun debugLine(tracker: Tracker, step: Tracker.Step) {
         val text = "$step ${tracker.lastPlies}p · shapes ${tracker.templates.known}/12 · off ${tracker.lastTypeMismatch} · ai $aiCalls · $engineName"
@@ -555,6 +709,7 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
 
     private fun showModel(m: OverlayModel) {
         overlayShown = true
+        lastModel = m
         val g = BoardGeom(m.board.left.toInt(), m.board.top.toInt(), m.board.width().toInt())
         val ends = HashSet<Int>()
         val crossed = HashSet<Int>()
@@ -562,6 +717,7 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
         for (mv in m.moves) pairs.add(Pair(mv.from, mv.to))
         for (s in m.line) pairs.add(Pair(s.from, s.to))
         if (m.threatFrom != null && m.threatTo != null) pairs.add(Pair(m.threatFrom, m.threatTo))
+        if (m.predFrom != null && m.predTo != null) pairs.add(Pair(m.predFrom, m.predTo))
         for ((a, b) in pairs) {
             ends.add(screenIndexOf(a.centerX(), a.centerY(), g))
             ends.add(screenIndexOf(b.centerX(), b.centerY(), g))
@@ -608,12 +764,17 @@ class ChessService : Service(), SideBarHost, SharedPreferences.OnSharedPreferenc
         val stop = PendingIntent.getService(
             this, 0, Intent(this, ChessService::class.java).setAction("STOP"), PendingIntent.FLAG_IMMUTABLE
         )
+        val pause = PendingIntent.getService(
+            this, 1, Intent(this, ChessService::class.java).setAction("PAUSE"), PendingIntent.FLAG_IMMUTABLE
+        )
         val icon = Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel)
+        val pauseIcon = Icon.createWithResource(this, if (paused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause)
         return Notification.Builder(this, "chess")
-            .setContentTitle("chess helper")
+            .setContentTitle(if (paused) "chess helper · paused" else "chess helper")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_menu_view)
+            .setSmallIcon(R.drawable.ic_king_small)
             .setOngoing(true)
+            .addAction(Notification.Action.Builder(pauseIcon, if (paused) "resume" else "pause", pause).build())
             .addAction(Notification.Action.Builder(icon, "stop", stop).build())
             .build()
     }

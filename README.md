@@ -16,7 +16,14 @@ github builds it for you. open the Actions tab and wait for the build (about 5 t
 2. tap "1. allow draw over other apps" and turn it on
 3. tap "2. start" and allow screen capture
 4. open your chess app. after a few seconds it shows 1 to 4 moves (you pick how many in the app) as arrows with a small list: dark green = best, light green = decent, yellow = acceptable, red with a skull = blunder. the numbers are stockfish's evaluation at full power, for both engines
-5. stop it from the app or from the notification
+5. stop or pause it from the app, the quick menu or the notification
+
+## extras
+
+- **guess the bot's move**: while the bot thinks, a faint dashed arrow with a "?" shows its likely move (maia3 at the bot's rating if you use maia3, else stockfish). your answer to that move is worked out early, so if the guess is right your moves show up at once ("ready early" on the card)
+- **live accuracy**: "you 87% · bot 72%" on the card, lichess style. each move is scored by how much it dropped the mover's winning chances. moves the app missed (two moves at once) are skipped
+- **bot rating**: set the rating of the bot you play against. used for the guess and told to maia3 as the opponent rating
+- **pause**: hides everything and stops reading the screen until you resume
 
 ## side bar (quick menu while playing)
 
@@ -32,6 +39,10 @@ on your pc (phone and pc on the same wifi):
     python tools/maia3_server.py
 
 it prints an address like 192.168.1.20:8765. in the app pick "maia3 (on my pc)" and type that address, the model and the rating. if the pc can't be reached the app falls back to stockfish for that move.
+
+**human-ness** (0 to 100%): 0 = always maia's most likely move (strongest). higher = it picks moves the way a real human of that rating would, randomness and mistakes included (maia3's temperature, 100% = 1.0).
+
+**away from home**: install tailscale on the pc and the phone with the same account, then use the pc's 100.x.x.x tailscale address instead. don't open the port on your router, the server has no password.
 
 ## if the build fails
 

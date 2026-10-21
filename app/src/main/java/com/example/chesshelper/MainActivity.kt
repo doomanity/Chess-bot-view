@@ -88,6 +88,7 @@ class MainActivity : Activity() {
         label(card, "i play")
         card.addView(seg(listOf("white" to "white", "black" to "black"), if (c.iAmWhite) "white" else "black") { v -> save { it.putString("color", v) } })
         card.addView(chip("it's my turn when i press start", c.myTurnAtStart) { on -> save { it.putBoolean("my_turn", on) } }, full(top = 10f))
+        card.addView(slider(400, 3000, 50, c.oppElo, { "the bot i play against is rated: $it" }) { v -> save { it.putInt("opp_elo", v) } })
 
         // ---- engine
         card = newCard("engine")
@@ -102,6 +103,10 @@ class MainActivity : Activity() {
             label(card, "maia3 model: 5m, 23m or 79m")
             maiaModelBox = input(card, c.maiaModel, "23m")
             card.addView(slider(600, 2600, 100, c.maiaElo, { "plays like a human of: $it" }) { v -> save { it.putInt("maia_elo", v) } })
+            card.addView(slider(0, 100, 5, c.maiaHuman,
+                { if (it == 0) "human-ness: 0% (always maia's top pick, strongest)" else "human-ness: $it% (100% = picks like a real human, mistakes included)" }) { v ->
+                save { it.putInt("maia_human", v) }
+            })
         } else {
             maiaHostBox = EditText(this).apply { setText(c.maiaHost) }
             maiaModelBox = EditText(this).apply { setText(c.maiaModel) }
@@ -120,6 +125,11 @@ class MainActivity : Activity() {
         chips.addView(chip("threat", c.showThreat) { on -> save { it.putBoolean("show_threat", on) } }, weight())
         chips.addView(chip("best line", c.showLine) { on -> save { it.putBoolean("show_line", on) } }, weight())
         card.addView(chips, full(top = 10f))
+        val chips2 = LinearLayout(this)
+        chips2.orientation = LinearLayout.HORIZONTAL
+        chips2.addView(chip("guess the bot's move", c.predict) { on -> save { it.putBoolean("predict", on) } }, weight())
+        chips2.addView(chip("live accuracy", c.showAcc) { on -> save { it.putBoolean("show_acc", on) } }, weight())
+        card.addView(chips2, full(top = 6f))
         label(card, "arrow style")
         card.addView(seg(listOf("neon" to "neon", "solid" to "solid", "minimal" to "minimal"), c.style) { v -> save { it.putString("arrow_style", v) } })
         label(card, "theme")
